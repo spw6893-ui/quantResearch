@@ -49,8 +49,14 @@ def step_data():
     if TUSHARE_TOKEN:
         df = loader.fetch_from_tushare()
     else:
-        logger.info("未设置TUSHARE_TOKEN，使用模拟数据")
-        df = loader.generate_synthetic_data(n_days=500)
+        # 优先使用AKShare获取真实数据
+        try:
+            df = loader.fetch_from_akshare()
+            if len(df) == 0:
+                raise ValueError("AKShare返回空数据")
+        except Exception as e:
+            logger.warning(f"AKShare获取失败({e})，使用模拟数据")
+            df = loader.generate_synthetic_data(n_days=500)
 
     df = loader.prepare_data()
     logger.info(f"数据量: {len(df)}, 列: {list(df.columns)}")

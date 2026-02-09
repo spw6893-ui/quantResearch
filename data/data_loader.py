@@ -1,6 +1,6 @@
 """
 数据加载与预处理模块
-支持从Tushare获取中芯国际(688981)分钟级数据
+支持从AKShare/Tushare获取中芯国际(688981)分钟级数据
 """
 import os
 import pickle
@@ -27,6 +27,46 @@ class DataLoader:
         self.symbol = symbol
         ensure_dir(RAW_DATA_DIR)
         ensure_dir(PROCESSED_DATA_DIR)
+
+    def fetch_from_akshare(self, period: str = "5", adjust: str = "qfq") -> pd.DataFrame:
+        """从AKShare获取分钟级数据 (免费, 无需token)"""
+        import akshare as ak
+
+        # 科创板688981 -> sh688981
+        ak_symbol = f"sh{SYMBOL}"
+        logger.info(f"从AKShare获取 {ak_symbol} {period}分钟K线数据 (前复权={adjust})")
+
+        try:
+            df = ak.stock_zh_a_minute(symbol=ak_symbol, period=period, adjust=adjust)
+        except Exception as e:
+            logger.error(f"AKShare获取数据失败: {e}")
+            return pd.DataFrame()
+
+        if df is None or len(df) == 0:
+            logger.error("AKShare未返回数据")
+            return pd.DataFrame()
+
+        # 预处理
+        df = df.rename(columns={'day': 'datetime'})
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.sort_values('datetime').reset_index(drop=True)
+
+        # AKShare没有amount列, 用 close*volume 近似
+        if 'amount' not in df.columns:
+            df['amount'] = (df['close'] * df['volume']).round(2)
+
+        df = df[['datetime', 'open', 'high', 'low', 'close', 'volume', 'amount']]
+        df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
+
+        # 保存
+        save_path = os.path.join(RAW_DATA_DIR, f"{SYMBOL}_5min.pkl")
+        df.to_pickle(save_path)
+        logger.info(f"AKShare数据已保存: {save_path}, 共 {len(df)} 条")
+        logger.info(f"  时间范围: {df['datetime'].min()} ~ {df['datetime'].max()}")
+
+        return df
 
     def fetch_from_tushare(self, start_date: str = DATA_START_DATE,
                            end_date: str = DATA_END_DATE,
@@ -189,20 +229,30 @@ class DataLoader:
     def load_local_data(self, filename: str = None) -> pd.DataFrame:
         """从本地加载数据"""
         if filename is None:
-            # 优先加载真实数据，其次加载模拟数据
+            # 优先加载真实数据，其次尝试AKShare，最后模拟数据
             real_path = os.path.join(RAW_DATA_DIR, f"{SYMBOL}_5min.pkl")
             synth_path = os.path.join(RAW_DATA_DIR, f"{SYMBOL}_5min_synthetic.pkl")
             if os.path.exists(real_path):
                 df = pd.read_pickle(real_path)
                 logger.info(f"加载真实数据: {len(df)} 条")
                 return df
-            elif os.path.exists(synth_path):
-                df = pd.read_pickle(synth_path)
-                logger.info(f"加载模拟数据: {len(df)} 条")
-                return df
             else:
-                logger.info("未找到本地数据，生成模拟数据")
-                return self.generate_synthetic_data()
+                # 尝试从AKShare获取
+                logger.info("本地无真实数据，尝试从AKShare获取...")
+                try:
+                    df = self.fetch_from_akshare()
+                    if len(df) > 0:
+                        return df
+                except Exception as e:
+                    logger.warning(f"AKShare获取失败: {e}")
+
+                if os.path.exists(synth_path):
+                    df = pd.read_pickle(synth_path)
+                    logger.info(f"加载模拟数据: {len(df)} 条")
+                    return df
+                else:
+                    logger.info("未找到任何数据，生成模拟数据")
+                    return self.generate_synthetic_data()
         else:
             path = os.path.join(RAW_DATA_DIR, filename)
             if os.path.exists(path):
