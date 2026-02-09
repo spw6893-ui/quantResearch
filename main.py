@@ -165,7 +165,7 @@ def step_analysis(results=None, X=None, y=None, feature_names=None):
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
 
-    interpreter = ModelInterpreter(model, feature_names)
+    interpreter = ModelInterpreter(model, feature_names, device=DEVICE)
     analysis_results = interpreter.full_analysis(X_train, X_test, y_test)
 
     logger.info("可解释性分析完成")

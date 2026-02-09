@@ -28,9 +28,9 @@ class ModelInterpreter:
     """模型可解释性分析器"""
 
     def __init__(self, model, feature_names: list, device: str = "cpu"):
-        self.model = model
-        self.feature_names = feature_names
         self.device = torch.device(device)
+        self.model = model.to(self.device)
+        self.feature_names = feature_names
         self.results_dir = os.path.join(RESULTS_DIR, "interpretability")
         ensure_dir(self.results_dir)
 
