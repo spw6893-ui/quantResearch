@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Data files
+data/raw/*.pkl
+data/processed/*.pkl
+data/features/*.pkl
+
+# Model weights
+models/*.pt
+models/*.pth
+
+# Results
+results/
+logs/
+
+# Environment
+.env
+*.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# VeighNa (submodule or vendored)
+vnpy/
