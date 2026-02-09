@@ -46,7 +46,7 @@ class ModelInterpreter:
             with torch.no_grad():
                 tensor_x = torch.FloatTensor(x).to(self.device)
                 logits = self.model(tensor_x)
-                probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                probs = torch.sigmoid(logits).cpu().numpy()
             return probs
 
         # 使用KernelExplainer (适用于所有模型)
@@ -124,7 +124,7 @@ class ModelInterpreter:
         x.requires_grad = True
 
         logits = self.model(x)
-        probs = torch.softmax(logits, dim=1)[:, 1]
+        probs = torch.sigmoid(logits)
         probs.sum().backward()
 
         gradients = x.grad.cpu().numpy()  # (n_samples, seq_len, n_features)
@@ -162,7 +162,7 @@ class ModelInterpreter:
         with torch.no_grad():
             x_tensor = torch.FloatTensor(X).to(self.device)
             logits = self.model(x_tensor)
-            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+            probs = torch.sigmoid(logits).cpu().numpy()
         base_auc = roc_auc_score(y, probs)
 
         n_features = X.shape[2]
@@ -178,7 +178,7 @@ class ModelInterpreter:
                 with torch.no_grad():
                     x_tensor = torch.FloatTensor(X_perm).to(self.device)
                     logits = self.model(x_tensor)
-                    probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                    probs = torch.sigmoid(logits).cpu().numpy()
                 perm_auc = roc_auc_score(y, probs)
                 importance_scores[repeat, feat_idx] = base_auc - perm_auc
 

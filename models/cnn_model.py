@@ -33,12 +33,13 @@ class CNNModel(nn.Module):
         self.conv_layers = nn.Sequential(*layers)
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
+        # 单输出用于BCE
         self.classifier = nn.Sequential(
             nn.Linear(num_filters[-1], fc_hidden_size),
-            nn.LayerNorm(fc_hidden_size),
+            nn.BatchNorm1d(fc_hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(fc_hidden_size, num_classes)
+            nn.Linear(fc_hidden_size, 1)
         )
         self._init_weights()
 
@@ -50,8 +51,9 @@ class CNNModel(nn.Module):
                 nn.init.zeros_(param)
 
     def forward(self, x):
-        # x: (batch, seq_len, features) -> (batch, features, seq_len)
+        """x: (batch, seq_len, features) -> (batch,) logits"""
         x = x.transpose(1, 2)
         x = self.conv_layers(x)
-        x = self.global_pool(x).squeeze(-1)  # (batch, num_filters[-1])
-        return self.classifier(x)
+        x = self.global_pool(x).squeeze(-1)
+        out = self.classifier(x)
+        return out.squeeze(-1)

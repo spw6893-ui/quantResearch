@@ -215,7 +215,7 @@ class T0SignalEngine:
 
         # 预测
         probs = self.ensemble.predict_proba(x_tensor)
-        prob_up = probs[0, 1]  # 上涨概率
+        prob_up = float(probs[0])  # 上涨概率
 
         bar_dt = bar_dict['datetime']
         if isinstance(bar_dt, str):

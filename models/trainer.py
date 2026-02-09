@@ -180,7 +180,7 @@ class ModelTrainer:
             optimizer.step()
             total_loss += loss.item()
 
-            probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+            probs = torch.sigmoid(logits).detach().cpu().numpy()
             all_preds.extend(probs)
             all_labels.extend(batch_y.cpu().numpy())
 
@@ -203,7 +203,7 @@ class ModelTrainer:
             loss = criterion(logits, batch_y)
             total_loss += loss.item()
 
-            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+            probs = torch.sigmoid(logits).cpu().numpy()
             all_preds.extend(probs)
             all_labels.extend(batch_y.cpu().numpy())
 
@@ -227,16 +227,16 @@ class ModelTrainer:
 
         # 数据加载器
         train_dataset = TensorDataset(
-            torch.FloatTensor(X_train), torch.LongTensor(y_train)
+            torch.FloatTensor(X_train), torch.FloatTensor(y_train.astype(np.float32))
         )
         val_dataset = TensorDataset(
-            torch.FloatTensor(X_val), torch.LongTensor(y_val)
+            torch.FloatTensor(X_val), torch.FloatTensor(y_val.astype(np.float32))
         )
-        train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
+        train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], drop_last=True)
 
-        # 损失函数和优化器
-        criterion = nn.CrossEntropyLoss()
+        # 损失函数和优化器 (BCE用于二分类单输出)
+        criterion = nn.BCEWithLogitsLoss()
         optimizer = torch.optim.Adam(
             model.parameters(),
             lr=config['learning_rate'],
@@ -321,10 +321,10 @@ class ModelTrainer:
 
             # 在测试集上评估
             test_dataset = TensorDataset(
-                torch.FloatTensor(X_test), torch.LongTensor(y_test)
+                torch.FloatTensor(X_test), torch.FloatTensor(y_test.astype(np.float32))
             )
-            test_loader = DataLoader(test_dataset, batch_size=TRAINING_CONFIG['batch_size'])
-            criterion = nn.CrossEntropyLoss()
+            test_loader = DataLoader(test_dataset, batch_size=TRAINING_CONFIG['batch_size'], drop_last=True)
+            criterion = nn.BCEWithLogitsLoss()
             _, test_auc, test_acc, test_preds, test_labels = self.evaluate(
                 model, test_loader, criterion
             )
@@ -440,19 +440,19 @@ class ModelTrainer:
                     model_type, input_size, seq_length, **model_kwargs
                 )
                 train_dataset = TensorDataset(
-                    torch.FloatTensor(X_train), torch.LongTensor(y_train)
+                    torch.FloatTensor(X_train), torch.FloatTensor(y_train.astype(np.float32))
                 )
                 val_dataset = TensorDataset(
-                    torch.FloatTensor(X_val), torch.LongTensor(y_val)
+                    torch.FloatTensor(X_val), torch.FloatTensor(y_val.astype(np.float32))
                 )
                 train_loader = DataLoader(
-                    train_dataset, batch_size=config['batch_size'], shuffle=True
+                    train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True
                 )
                 val_loader = DataLoader(
-                    val_dataset, batch_size=config['batch_size']
+                    val_dataset, batch_size=config['batch_size'], drop_last=True
                 )
 
-                criterion = nn.CrossEntropyLoss()
+                criterion = nn.BCEWithLogitsLoss()
                 optimizer = torch.optim.Adam(
                     model.parameters(),
                     lr=config['learning_rate'],

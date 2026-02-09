@@ -14,22 +14,23 @@ class LSTMModel(nn.Module):
         super().__init__()
         self.model_name = "lstm"
 
-        self.input_ln = nn.LayerNorm(input_size)
+        self.input_bn = nn.BatchNorm1d(input_size)
 
         self.lstm = nn.LSTM(
             input_size=input_size, hidden_size=hidden_size,
             num_layers=num_layers, batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
-        self.lstm_ln = nn.LayerNorm(hidden_size)
+        self.lstm_bn = nn.BatchNorm1d(hidden_size)
         self.dropout = nn.Dropout(dropout)
 
+        # 单输出用于BCE
         self.classifier = nn.Sequential(
             nn.Linear(hidden_size, fc_hidden_size),
-            nn.LayerNorm(fc_hidden_size),
+            nn.BatchNorm1d(fc_hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(fc_hidden_size, num_classes)
+            nn.Linear(fc_hidden_size, 1)
         )
         self._init_weights()
 
@@ -46,11 +47,14 @@ class LSTMModel(nn.Module):
                 nn.init.xavier_uniform_(param)
 
     def forward(self, x):
-        # Input LayerNorm
-        x = self.input_ln(x)
+        """x: (batch, seq_len, input_size) -> (batch,) logits"""
+        x = x.transpose(1, 2)
+        x = self.input_bn(x)
+        x = x.transpose(1, 2)
 
         lstm_out, _ = self.lstm(x)
         last = lstm_out[:, -1, :]
-        last = self.lstm_ln(last)
+        last = self.lstm_bn(last)
         last = self.dropout(last)
-        return self.classifier(last)
+        out = self.classifier(last)
+        return out.squeeze(-1)

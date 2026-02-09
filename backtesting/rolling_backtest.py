@@ -121,7 +121,7 @@ class RollingBacktest:
             with torch.no_grad():
                 x_tensor = torch.FloatTensor(X_test).to(DEVICE)
                 logits = model(x_tensor)
-                probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                probs = torch.sigmoid(logits).cpu().numpy()
                 preds = (probs >= T0_CONFIG_THRESHOLD).astype(int)
 
             all_predictions.extend(preds)

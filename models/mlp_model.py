@@ -22,13 +22,14 @@ class MLPModel(nn.Module):
         for hs in hidden_sizes:
             layers.extend([
                 nn.Linear(in_size, hs),
-                nn.LayerNorm(hs),
+                nn.BatchNorm1d(hs),
                 nn.GELU(),
                 nn.Dropout(dropout),
             ])
             in_size = hs
 
-        layers.append(nn.Linear(in_size, num_classes))
+        # 单输出用于BCE
+        layers.append(nn.Linear(in_size, 1))
         self.network = nn.Sequential(*layers)
         self._init_weights()
 
@@ -40,6 +41,7 @@ class MLPModel(nn.Module):
                 nn.init.zeros_(param)
 
     def forward(self, x):
-        # x: (batch, seq_len, features) -> flatten
+        """x: (batch, seq_len, features) -> (batch,) logits"""
         x = x.reshape(x.size(0), -1)
-        return self.network(x)
+        out = self.network(x)
+        return out.squeeze(-1)

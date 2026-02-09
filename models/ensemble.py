@@ -29,14 +29,14 @@ class EnsembleModel:
         self.weights = {k: v/total for k, v in self.weights.items()}
 
     def predict_proba(self, x: torch.Tensor) -> np.ndarray:
-        """集成预测概率"""
+        """集成预测概率 (返回1D数组, 每个元素为上涨概率)"""
         all_probs = []
         for name, model in self.models.items():
             model.eval()
             with torch.no_grad():
                 x_input = x.to(self.device)
                 logits = model(x_input)
-                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                probs = torch.sigmoid(logits).cpu().numpy()
                 all_probs.append(probs * self.weights[name])
 
         ensemble_probs = np.sum(all_probs, axis=0)
@@ -45,7 +45,7 @@ class EnsembleModel:
     def predict(self, x: torch.Tensor, threshold: float = 0.5) -> np.ndarray:
         """集成预测类别"""
         probs = self.predict_proba(x)
-        return (probs[:, 1] >= threshold).astype(int)
+        return (probs >= threshold).astype(int)
 
     def optimize_weights(self, val_loader, metric_fn):
         """使用验证集优化集成权重"""
@@ -62,7 +62,7 @@ class EnsembleModel:
                 for batch_x, batch_y in val_loader:
                     batch_x = batch_x.to(self.device)
                     logits = model(batch_x)
-                    probs = torch.softmax(logits, dim=1).cpu().numpy()
+                    probs = torch.sigmoid(logits).cpu().numpy()
                     probs_list.append(probs)
                     if name == list(self.models.keys())[0]:
                         all_labels.append(batch_y.numpy())
@@ -74,7 +74,7 @@ class EnsembleModel:
         def objective(w):
             w = np.abs(w) / np.sum(np.abs(w))  # 归一化
             ensemble = sum(model_probs[name] * w[i] for i, name in enumerate(model_names))
-            score = metric_fn(all_labels, ensemble[:, 1])
+            score = metric_fn(all_labels, ensemble)
             return -score  # 最大化
 
         n = len(model_names)

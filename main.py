@@ -250,7 +250,7 @@ def step_backtest(results=None, X=None, y=None, ts=None, feature_names=None):
     else:
         ensemble = EnsembleModel(models, ENSEMBLE_WEIGHTS, device)
         x_tensor = torch.FloatTensor(X_test)
-        probabilities = ensemble.predict_proba(x_tensor)[:, 1]
+        probabilities = ensemble.predict_proba(x_tensor)
         predictions = (probabilities >= T0_CONFIG['signal_threshold']).astype(int)
         logger.info(f"集成模型预测完成: {len(predictions)} 条")
 
