@@ -47,7 +47,7 @@ VWAP_ENABLED = True
 
 # 时序特征
 LOOKBACK_WINDOW = 60  # 历史回看窗口(60个5分钟K线 = 5小时)
-PREDICT_HORIZON = 1   # 预测未来1个周期
+PREDICT_HORIZON = 6   # 预测未来6个周期(30分钟)
 SEQUENCE_LENGTH = 30  # 模型输入序列长度
 
 # 特征选择
