@@ -1,6 +1,6 @@
 """
 数据加载与预处理模块
-支持从AKShare/Tushare获取中芯国际(688981)分钟级数据
+支持从BaoStock/AKShare/Tushare获取中芯国际(688981)分钟级数据
 """
 import os
 import pickle
@@ -27,6 +27,99 @@ class DataLoader:
         self.symbol = symbol
         ensure_dir(RAW_DATA_DIR)
         ensure_dir(PROCESSED_DATA_DIR)
+
+    def fetch_from_baostock(self, start_date: str = None, end_date: str = None,
+                            freq: str = "5", adjust: str = "2") -> pd.DataFrame:
+        """
+        从BaoStock获取分钟级数据 (免费, 无需token, 可回溯至上市日)
+        按季度分段获取，避免单次查询迭代过慢
+        Args:
+            start_date: 开始日期 YYYY-MM-DD
+            end_date: 结束日期 YYYY-MM-DD
+            freq: "5", "15", "30", "60"
+            adjust: "1"后复权 "2"前复权 "3"不复权
+        """
+        import baostock as bs
+
+        if start_date is None:
+            start_date = datetime.strptime(DATA_START_DATE, "%Y%m%d").strftime("%Y-%m-%d")
+        if end_date is None:
+            end_date = datetime.strptime(DATA_END_DATE, "%Y%m%d").strftime("%Y-%m-%d")
+
+        bs_symbol = f"sh.{SYMBOL}"
+        logger.info(f"从BaoStock获取 {bs_symbol} {freq}分钟K线数据: {start_date} -> {end_date}")
+
+        # 按季度(90天)分段获取
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        chunk_days = 90
+        all_chunks = []
+        current = start_dt
+
+        while current < end_dt:
+            chunk_end = min(current + timedelta(days=chunk_days), end_dt)
+            s = current.strftime("%Y-%m-%d")
+            e = chunk_end.strftime("%Y-%m-%d")
+
+            lg = bs.login()
+            if lg.error_code != '0':
+                logger.error(f"BaoStock登录失败: {lg.error_msg}")
+                current = chunk_end + timedelta(days=1)
+                continue
+
+            try:
+                rs = bs.query_history_k_data_plus(
+                    bs_symbol,
+                    "date,time,open,high,low,close,volume,amount",
+                    start_date=s, end_date=e,
+                    frequency=freq, adjustflag=adjust
+                )
+                if rs.error_code != '0':
+                    logger.warning(f"  查询失败 [{s}~{e}]: {rs.error_msg}")
+                    current = chunk_end + timedelta(days=1)
+                    continue
+
+                data = []
+                while rs.error_code == '0' and rs.next():
+                    data.append(rs.get_row_data())
+
+                if data:
+                    chunk_df = pd.DataFrame(data, columns=rs.fields)
+                    all_chunks.append(chunk_df)
+                    logger.info(f"  获取 [{s} ~ {e}]: {len(data)} 条")
+                else:
+                    logger.info(f"  [{s} ~ {e}]: 无数据")
+            finally:
+                bs.logout()
+
+            current = chunk_end + timedelta(days=1)
+
+        if not all_chunks:
+            logger.error("BaoStock未获取到任何数据")
+            return pd.DataFrame()
+
+        df = pd.concat(all_chunks, ignore_index=True)
+
+        # 预处理: time格式 20240102093500000 -> datetime
+        df['datetime'] = df['time'].apply(
+            lambda t: datetime.strptime(t[:14], "%Y%m%d%H%M%S")
+        )
+
+        for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        df = df[['datetime', 'open', 'high', 'low', 'close', 'volume', 'amount']]
+        df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
+        df = df[(df['close'] > 0) & (df['volume'] > 0)]
+        df = df.drop_duplicates(subset=['datetime']).sort_values('datetime').reset_index(drop=True)
+
+        # 保存
+        save_path = os.path.join(RAW_DATA_DIR, f"{SYMBOL}_5min.pkl")
+        df.to_pickle(save_path)
+        logger.info(f"BaoStock数据已保存: {save_path}, 共 {len(df)} 条")
+        logger.info(f"  时间范围: {df['datetime'].min()} ~ {df['datetime'].max()}")
+
+        return df
 
     def fetch_from_akshare(self, period: str = "5", adjust: str = "qfq") -> pd.DataFrame:
         """从AKShare获取分钟级数据 (免费, 无需token)"""
@@ -237,8 +330,17 @@ class DataLoader:
                 logger.info(f"加载真实数据: {len(df)} 条")
                 return df
             else:
-                # 尝试从AKShare获取
-                logger.info("本地无真实数据，尝试从AKShare获取...")
+                # 尝试从BaoStock获取(可回溯至上市日)
+                logger.info("本地无真实数据，尝试从BaoStock获取...")
+                try:
+                    df = self.fetch_from_baostock()
+                    if len(df) > 0:
+                        return df
+                except Exception as e:
+                    logger.warning(f"BaoStock获取失败: {e}")
+
+                # 其次尝试AKShare(最近1-2个月)
+                logger.info("尝试从AKShare获取...")
                 try:
                     df = self.fetch_from_akshare()
                     if len(df) > 0:
