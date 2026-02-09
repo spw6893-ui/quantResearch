@@ -46,25 +46,23 @@ def step_data():
     logger.info("=" * 60)
 
     loader = DataLoader()
-    if TUSHARE_TOKEN:
-        df = loader.fetch_from_tushare()
-    else:
-        # 优先BaoStock(长历史), 其次AKShare(近期), 最后模拟数据
-        try:
-            df = loader.fetch_from_baostock()
-            if len(df) == 0:
-                raise ValueError("BaoStock返回空数据")
-        except Exception as e:
-            logger.warning(f"BaoStock获取失败({e})，尝试AKShare")
-            try:
-                df = loader.fetch_from_akshare()
-                if len(df) == 0:
-                    raise ValueError("AKShare返回空数据")
-            except Exception as e2:
-                logger.warning(f"AKShare获取失败({e2})，使用模拟数据")
-                df = loader.generate_synthetic_data(n_days=500)
-
+    # 优先加载本地已有数据，避免重复拉取
     df = loader.prepare_data()
+    if len(df) == 0:
+        logger.warning("本地无数据，尝试远程获取...")
+        if TUSHARE_TOKEN:
+            loader.fetch_from_tushare()
+        else:
+            try:
+                loader.fetch_from_baostock()
+            except Exception as e:
+                logger.warning(f"BaoStock获取失败({e})，尝试AKShare")
+                try:
+                    loader.fetch_from_akshare()
+                except Exception as e2:
+                    logger.warning(f"AKShare获取失败({e2})，使用模拟数据")
+                    loader.generate_synthetic_data(n_days=500)
+        df = loader.prepare_data()
     logger.info(f"数据量: {len(df)}, 列: {list(df.columns)}")
     return df
 
