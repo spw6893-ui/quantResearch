@@ -6,8 +6,8 @@ build/
 *.egg
 .eggs/
 
-# Data files
-data/raw/*.pkl
+# Data files (keep raw 5min data, ignore processed/features)
+!data/raw/688981_5min.pkl
 data/processed/*.pkl
 data/features/*.pkl
 
