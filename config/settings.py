@@ -57,7 +57,8 @@ MAX_FEATURES = 50  # 最大特征数
 # ============ 模型设置 ============
 # 通用设置
 RANDOM_SEED = 42
-DEVICE = "cpu"  # cpu or cuda
+import torch as _torch
+DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
 NUM_CLASSES = 2  # 二分类: 涨/跌
 
 # Transformer-LSTM混合模型
