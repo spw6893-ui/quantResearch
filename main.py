@@ -33,6 +33,7 @@ from models.lstm_model import LSTMModel
 from models.cnn_model import CNNModel
 from models.mlp_model import MLPModel
 from models.lgbm_model import LGBMModel
+from models.xgb_model import XGBModel
 from analysis.interpretability import ModelInterpreter
 from backtesting.backtest_engine import BacktestEngine
 from backtesting.rolling_backtest import RollingBacktest
@@ -263,6 +264,19 @@ def step_backtest(results=None, X=None, y=None, ts=None, feature_names=None):
             lgbm.model = lgb_lib.Booster(model_file=lgbm_path)
             models['lgbm'] = lgbm
             logger.info("加载模型: lgbm")
+
+    # XGBoost
+    if results and 'xgboost' in results and results['xgboost']['best_model'] is not None:
+        models['xgboost'] = results['xgboost']['best_model']
+    else:
+        xgb_path = os.path.join(MODEL_DIR, "xgboost_best.json")
+        if os.path.exists(xgb_path):
+            import xgboost as xgb_lib
+            xgbm = XGBModel()
+            xgbm.model = xgb_lib.Booster()
+            xgbm.model.load_model(xgb_path)
+            models['xgboost'] = xgbm
+            logger.info("加载模型: xgboost")
 
     if not models:
         logger.warning("没有可用的模型，使用随机预测进行回测演示")

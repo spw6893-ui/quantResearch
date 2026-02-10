@@ -29,8 +29,8 @@ class EnsembleModel:
         self.weights = {k: v/total for k, v in self.weights.items()}
 
     @staticmethod
-    def _is_lgbm(model):
-        return hasattr(model, 'model_name') and model.model_name == 'lgbm'
+    def _is_tree_model(model):
+        return hasattr(model, 'model_name') and model.model_name in ('lgbm', 'xgboost')
 
     def predict_proba(self, x) -> np.ndarray:
         """集成预测概率 (返回1D数组, 每个元素为上涨概率)"""
@@ -41,7 +41,7 @@ class EnsembleModel:
 
         all_probs = []
         for name, model in self.models.items():
-            if self._is_lgbm(model):
+            if self._is_tree_model(model):
                 probs = model.predict_proba(x_np)
             else:
                 model.eval()

@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import (
     TRAINING_CONFIG, CV_CONFIG, OPTUNA_CONFIG, MODEL_DIR,
-    TRANSFORMER_LSTM_CONFIG, LSTM_CONFIG, CNN_CONFIG, MLP_CONFIG, LGBM_CONFIG,
+    TRANSFORMER_LSTM_CONFIG, LSTM_CONFIG, CNN_CONFIG, MLP_CONFIG, LGBM_CONFIG, XGB_CONFIG,
     SEQUENCE_LENGTH, DEVICE, RANDOM_SEED
 )
 from models.transformer_lstm import TransformerLSTM
@@ -25,6 +25,7 @@ from models.lstm_model import LSTMModel
 from models.cnn_model import CNNModel
 from models.mlp_model import MLPModel
 from models.lgbm_model import LGBMModel
+from models.xgb_model import XGBModel
 from utils.logger import get_logger
 from utils.helpers import set_seed, ensure_dir
 
@@ -231,7 +232,6 @@ class ModelTrainer:
         model.fit(X_train, y_train, X_val, y_val,
                  num_boost_round=config.get('max_epochs', 100) * 10 if config else 1000,
                  early_stopping_rounds=50)
-        # 评估
         probs = model.predict_proba(X_val)
         from sklearn.metrics import roc_auc_score, accuracy_score
         val_auc = roc_auc_score(y_val, probs) if len(set(y_val)) > 1 else 0.5
@@ -240,15 +240,31 @@ class ModelTrainer:
         logger.info(f"  LightGBM: val_auc={val_auc:.4f}, val_acc={val_acc:.4f}")
         return model, metrics
 
+    def _train_xgboost(self, X_train, y_train, X_val, y_val, config=None):
+        """训练XGBoost模型"""
+        model = XGBModel(**XGB_CONFIG)
+        model.fit(X_train, y_train, X_val, y_val,
+                 num_boost_round=config.get('max_epochs', 100) * 10 if config else 1000,
+                 early_stopping_rounds=50)
+        probs = model.predict_proba(X_val)
+        from sklearn.metrics import roc_auc_score, accuracy_score
+        val_auc = roc_auc_score(y_val, probs) if len(set(y_val)) > 1 else 0.5
+        val_acc = accuracy_score(y_val, (probs >= 0.5).astype(int))
+        metrics = {'val_auc': val_auc, 'val_acc': val_acc, 'epoch': 0}
+        logger.info(f"  XGBoost: val_auc={val_auc:.4f}, val_acc={val_acc:.4f}")
+        return model, metrics
+
     def train_model(self, model_type: str, X_train, y_train, X_val, y_val,
                     config: dict = None) -> tuple:
         """训练单个模型"""
         if config is None:
             config = TRAINING_CONFIG
 
-        # LightGBM走单独路径
+        # LightGBM/XGBoost走单独路径
         if model_type == "lgbm":
             return self._train_lgbm(X_train, y_train, X_val, y_val, config)
+        if model_type == "xgboost":
+            return self._train_xgboost(X_train, y_train, X_val, y_val, config)
 
         input_size = X_train.shape[2]
         seq_length = X_train.shape[1]
@@ -352,7 +368,7 @@ class ModelTrainer:
             )
 
             # 在测试集上评估
-            if model_type == "lgbm":
+            if model_type in ("lgbm", "xgboost"):
                 test_preds = model.predict_proba(X_test)
                 test_labels = y_test
                 test_auc = roc_auc_score(y_test, test_preds) if len(set(y_test)) > 1 else 0.5
@@ -575,7 +591,7 @@ class ModelTrainer:
                     cfg.MLP_CONFIG.update(arch)
                 logger.info(f"  {mt} 应用Optuna架构参数: {arch}")
 
-        model_types = ["lgbm", "transformer_lstm", "lstm", "cnn", "mlp"]
+        model_types = ["lgbm", "xgboost", "transformer_lstm", "lstm", "cnn", "mlp"]
         results = {}
 
         for mt in model_types:
@@ -588,6 +604,9 @@ class ModelTrainer:
             # 保存模型
             if mt == "lgbm":
                 model_path = os.path.join(MODEL_DIR, f"{mt}_best.txt")
+                cv_result['best_model'].model.save_model(model_path)
+            elif mt == "xgboost":
+                model_path = os.path.join(MODEL_DIR, f"{mt}_best.json")
                 cv_result['best_model'].model.save_model(model_path)
             else:
                 model_path = os.path.join(MODEL_DIR, f"{mt}_best.pt")

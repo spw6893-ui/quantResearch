@@ -53,7 +53,7 @@ DYNAMIC_PERIODS_MIN_STRENGTH = 0.02  # 最小自相关强度
 
 # 时序特征
 LOOKBACK_WINDOW = 120  # 历史回看窗口(120个5分钟K线 = 10小时)
-PREDICT_HORIZON = 6    # 预测未来6个周期(30分钟)
+PREDICT_HORIZON = 12   # 预测未来12个周期(1小时)
 SEQUENCE_LENGTH = 60   # 模型输入序列长度 (扩大以容纳更长周期)
 
 # 特征选择
@@ -112,13 +112,26 @@ LGBM_CONFIG = {
     "min_gain_to_split": 0.01,
 }
 
+# XGBoost模型
+XGB_CONFIG = {
+    "max_depth": 5,
+    "learning_rate": 0.03,
+    "subsample": 0.7,
+    "colsample_bytree": 0.5,
+    "min_child_weight": 100,
+    "reg_alpha": 1.0,
+    "reg_lambda": 1.0,
+    "gamma": 0.01,
+}
+
 # 集成模型权重 (初始值，可通过训练调整)
 ENSEMBLE_WEIGHTS = {
-    "transformer_lstm": 0.3,
-    "lstm": 0.15,
+    "transformer_lstm": 0.2,
+    "lstm": 0.1,
     "cnn": 0.1,
-    "mlp": 0.1,
-    "lgbm": 0.35,
+    "mlp": 0.05,
+    "lgbm": 0.3,
+    "xgboost": 0.25,
 }
 
 # ============ 训练设置 ============
