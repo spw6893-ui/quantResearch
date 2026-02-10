@@ -300,6 +300,85 @@ class FeatureEngineer:
 
         return df
 
+    # ============ 日内结构特征 ============
+
+    def _add_intraday_structure(self, df: pd.DataFrame) -> pd.DataFrame:
+        """日内结构性特征: 隔夜跳空、开盘动量、午盘效应"""
+        if 'datetime' not in df.columns:
+            return df
+
+        _date = df['datetime'].dt.date
+
+        # 隔夜跳空: 今开 vs 昨收
+        daily_close = df.groupby(_date)['close'].last()
+        daily_open = df.groupby(_date)['open'].first()
+        overnight_gap = (daily_open / daily_close.shift(1) - 1)
+        gap_map = overnight_gap.to_dict()
+        df['overnight_gap'] = _date.map(gap_map)
+
+        # 开盘30分钟动量: 开盘后6根K线的收益率
+        def calc_open_momentum(group):
+            if len(group) >= 6:
+                mom = group['close'].iloc[5] / group['open'].iloc[0] - 1
+            else:
+                mom = 0.0
+            return pd.Series(mom, index=group.index)
+
+        df['open_30min_momentum'] = df.groupby(_date).apply(calc_open_momentum).reset_index(level=0, drop=True)
+
+        # 日内累计收益 (从开盘算起)
+        daily_first_close = df.groupby(_date)['close'].transform('first')
+        df['intraday_return'] = df['close'] / daily_first_close - 1
+
+        # 上午vs下午成交量比
+        df['_is_am'] = (df['datetime'].dt.hour < 12).astype(int)
+        am_vol = df.groupby([_date, '_is_am'])['volume'].transform('sum')
+        pm_vol_map = df[df['_is_am'] == 0].groupby(df.loc[df['_is_am'] == 0, 'datetime'].dt.date)['volume'].sum()
+        am_vol_map = df[df['_is_am'] == 1].groupby(df.loc[df['_is_am'] == 1, 'datetime'].dt.date)['volume'].sum()
+        ratio_map = (am_vol_map / (pm_vol_map.reindex(am_vol_map.index, fill_value=1) + 1e-10)).to_dict()
+        df['am_pm_vol_ratio'] = _date.map(ratio_map).fillna(1.0)
+        df.drop(columns=['_is_am'], inplace=True)
+
+        return df
+
+    # ============ 大盘指数特征 ============
+
+    def _add_index_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """合并大盘指数(沪深300)日线特征到5分钟数据"""
+        try:
+            from data.data_loader import DataLoader
+            loader = DataLoader()
+            idx_df = loader.load_index_features("sh.000300")
+        except Exception as e:
+            logger.warning(f"加载指数数据失败: {e}, 跳过指数特征")
+            return df
+
+        if idx_df is None or len(idx_df) == 0:
+            return df
+
+        # 指数特征列
+        idx_cols = [c for c in idx_df.columns if c.startswith('idx_')]
+        if not idx_cols:
+            return df
+
+        merge_df = idx_df[['date'] + idx_cols].copy()
+        merge_df = merge_df.rename(columns={'date': '_idx_date'})
+        df['_merge_date'] = df['datetime'].dt.date
+        df = df.merge(merge_df, left_on='_merge_date', right_on='_idx_date', how='left')
+        df.drop(columns=['_merge_date', '_idx_date'], inplace=True, errors='ignore')
+
+        # 个股vs大盘相对强弱
+        if 'return_1' in df.columns and 'idx_return_1d' in df.columns:
+            df['relative_strength_1d'] = df['return_1'] - df['idx_return_1d'].fillna(0)
+
+        # 填充NaN (周末/节假日没有指数数据)
+        for col in idx_cols:
+            if col in df.columns:
+                df[col] = df[col].ffill().fillna(0)
+
+        logger.info(f"已添加 {len(idx_cols)+1} 个指数特征")
+        return df
+
     # ============ 特征构建主流程 ============
 
     def build_features(self, df: pd.DataFrame, train_end_idx: int = None) -> pd.DataFrame:
@@ -326,6 +405,8 @@ class FeatureEngineer:
         df = self._add_price_features(df)
         df = self._add_time_features(df)
         df = self._add_multiscale_features(df)
+        df = self._add_intraday_structure(df)
+        df = self._add_index_features(df)
 
         # 动态周期检测和特征生成 (只用训练集检测)
         if DYNAMIC_PERIODS_ENABLED:

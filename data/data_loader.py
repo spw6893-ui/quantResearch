@@ -379,6 +379,69 @@ class DataLoader:
         return df
 
 
+    def fetch_index_daily(self, index_code: str = "sh.000300",
+                          start_date: str = None, end_date: str = None) -> pd.DataFrame:
+        """从BaoStock获取指数日线数据 (沪深300等)"""
+        import baostock as bs
+
+        if start_date is None:
+            start_date = datetime.strptime(DATA_START_DATE, "%Y%m%d").strftime("%Y-%m-%d")
+        if end_date is None:
+            end_date = datetime.strptime(DATA_END_DATE, "%Y%m%d").strftime("%Y-%m-%d")
+
+        logger.info(f"获取指数日线数据: {index_code}, {start_date} -> {end_date}")
+        lg = bs.login()
+        if lg.error_code != '0':
+            logger.error(f"BaoStock登录失败: {lg.error_msg}")
+            return pd.DataFrame()
+
+        try:
+            rs = bs.query_history_k_data_plus(
+                index_code,
+                "date,open,high,low,close,volume,amount",
+                start_date=start_date, end_date=end_date,
+                frequency="d"
+            )
+            data = []
+            while rs.error_code == '0' and rs.next():
+                data.append(rs.get_row_data())
+        finally:
+            bs.logout()
+
+        if not data:
+            logger.warning(f"指数 {index_code} 无数据")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data, columns=['date', 'open', 'high', 'low', 'close', 'volume', 'amount'])
+        for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df['date'] = pd.to_datetime(df['date']).dt.date
+
+        # 计算指数特征
+        df['idx_return_1d'] = df['close'].pct_change()
+        df['idx_return_5d'] = df['close'].pct_change(5)
+        df['idx_volatility_5d'] = df['close'].pct_change().rolling(5).std()
+        df['idx_volatility_20d'] = df['close'].pct_change().rolling(20).std()
+        df['idx_ma5_ratio'] = df['close'] / df['close'].rolling(5).mean()
+        df['idx_ma20_ratio'] = df['close'] / df['close'].rolling(20).mean()
+
+        # 保存
+        save_path = os.path.join(RAW_DATA_DIR, f"index_{index_code.replace('.', '_')}_daily.pkl")
+        df.to_pickle(save_path)
+        logger.info(f"指数数据已保存: {save_path}, {len(df)} 条")
+
+        return df
+
+    def load_index_features(self, index_code: str = "sh.000300") -> pd.DataFrame:
+        """加载或获取指数日线特征"""
+        save_path = os.path.join(RAW_DATA_DIR, f"index_{index_code.replace('.', '_')}_daily.pkl")
+        if os.path.exists(save_path):
+            df = pd.read_pickle(save_path)
+            logger.info(f"加载指数缓存: {save_path}, {len(df)} 条")
+            return df
+        return self.fetch_index_daily(index_code)
+
+
 if __name__ == "__main__":
     loader = DataLoader()
     # 生成模拟数据用于开发测试

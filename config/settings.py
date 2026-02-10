@@ -98,17 +98,18 @@ MLP_CONFIG = {
     "dropout": 0.3,
 }
 
-# LightGBM模型
+# LightGBM模型 (强正则化防过拟合)
 LGBM_CONFIG = {
-    "num_leaves": 63,
-    "max_depth": 8,
-    "learning_rate": 0.05,
-    "feature_fraction": 0.8,
-    "bagging_fraction": 0.8,
+    "num_leaves": 15,
+    "max_depth": 5,
+    "learning_rate": 0.03,
+    "feature_fraction": 0.5,
+    "bagging_fraction": 0.7,
     "bagging_freq": 5,
-    "min_child_samples": 50,
-    "lambda_l1": 0.1,
-    "lambda_l2": 0.1,
+    "min_child_samples": 100,
+    "lambda_l1": 1.0,
+    "lambda_l2": 1.0,
+    "min_gain_to_split": 0.01,
 }
 
 # 集成模型权重 (初始值，可通过训练调整)
