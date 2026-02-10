@@ -117,7 +117,8 @@ class ModelInterpreter:
     def gradient_importance(self, X_sample, n_samples: int = 200):
         """梯度重要性分析: 识别关键预测因子"""
         logger.info("开始梯度重要性分析...")
-        self.model.eval()
+        # 用train模式确保BatchNorm不会干扰梯度计算
+        self.model.train()
 
         idx = np.random.choice(len(X_sample), min(n_samples, len(X_sample)), replace=False)
         x = torch.FloatTensor(X_sample[idx]).to(self.device)
@@ -126,6 +127,8 @@ class ModelInterpreter:
         logits = self.model(x)
         probs = torch.sigmoid(logits)
         probs.sum().backward()
+
+        self.model.eval()
 
         gradients = x.grad.cpu().numpy()  # (n_samples, seq_len, n_features)
         grad_importance = np.abs(gradients).mean(axis=(0, 1))  # 对样本和时间步取均值
