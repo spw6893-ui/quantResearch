@@ -173,32 +173,30 @@ def step_analysis(results=None, X=None, y=None, feature_names=None):
     return analysis_results
 
 
-def step_rolling_backtest(X=None, y=None, ts=None, feature_names=None):
-    """步骤5b: 滚动窗口回测"""
+def step_rolling_backtest(df_featured=None, fe=None):
+    """步骤5b: 滚动窗口回测 (每个窗口重新检测动态周期)"""
     logger.info("=" * 60)
     logger.info("步骤5b: 滚动窗口回测")
     logger.info("=" * 60)
 
-    if X is None:
-        data_path = os.path.join(PROCESSED_DATA_DIR, "processed_data.pkl")
-        with open(data_path, 'rb') as f:
-            data = pickle.load(f)
-        X, y, ts = data['X'], data['y'], data['timestamps']
-        feature_names = data['feature_names']
+    if df_featured is None:
+        df_path = os.path.join(PROCESSED_DATA_DIR, "featured_df.pkl")
+        if os.path.exists(df_path):
+            df_featured = pd.read_pickle(df_path)
+        else:
+            loader = DataLoader()
+            df_raw = loader.prepare_data()
+            fe = FeatureEngineer()
+            df_featured = fe.build_features(df_raw)
 
-    df_path = os.path.join(PROCESSED_DATA_DIR, "featured_df.pkl")
-    if os.path.exists(df_path):
-        df_full = pd.read_pickle(df_path)
-    else:
-        loader = DataLoader()
-        df_full = loader.prepare_data()
+    if fe is None:
+        fe = FeatureEngineer()
 
-    prices_df = pd.DataFrame({'close': df_full['close'].values})
+    prices_df = pd.DataFrame({'close': df_featured['close'].values})
 
     rb = RollingBacktest()
     result = rb.run(
-        X=X, y=y, timestamps=ts,
-        prices_df=prices_df, feature_names=feature_names
+        df_featured=df_featured, prices_df=prices_df, fe=fe
     )
     return result
 

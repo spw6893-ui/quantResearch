@@ -206,9 +206,14 @@ class FeatureEngineer:
 
     # ============ 动态周期检测 ============
 
-    def _detect_dominant_periods(self, df: pd.DataFrame) -> list:
-        """用自相关检测价格收益率的主导周期"""
-        returns = df['close'].pct_change().dropna().values
+    def _detect_dominant_periods(self, df: pd.DataFrame, end_idx: int = None) -> list:
+        """用自相关检测价格收益率的主导周期
+
+        Args:
+            end_idx: 只用df.iloc[:end_idx]的数据做检测，避免数据泄露
+        """
+        close = df['close'].iloc[:end_idx] if end_idx else df['close']
+        returns = close.pct_change().dropna().values
         if len(returns) < 500:
             logger.info("数据量不足，跳过动态周期检测")
             return []
@@ -297,8 +302,13 @@ class FeatureEngineer:
 
     # ============ 特征构建主流程 ============
 
-    def build_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """构建全部技术指标和特征"""
+    def build_features(self, df: pd.DataFrame, train_end_idx: int = None) -> pd.DataFrame:
+        """构建全部技术指标和特征
+
+        Args:
+            train_end_idx: 动态周期检测只用[:train_end_idx]数据，避免数据泄露
+                          默认使用70%数据
+        """
         logger.info("开始构建特征...")
         df = df.copy()
 
@@ -317,12 +327,15 @@ class FeatureEngineer:
         df = self._add_time_features(df)
         df = self._add_multiscale_features(df)
 
-        # 动态周期检测和特征生成
+        # 动态周期检测和特征生成 (只用训练集检测)
         if DYNAMIC_PERIODS_ENABLED:
-            detected_periods = self._detect_dominant_periods(df)
+            detect_end = train_end_idx or int(len(df) * 0.7)
+            detected_periods = self._detect_dominant_periods(df, end_idx=detect_end)
             if detected_periods:
                 df = self._add_dynamic_period_features(df, detected_periods)
                 self._detected_periods = detected_periods
+            else:
+                self._detected_periods = []
 
         # 创建标签: 未来N期收益率是否为正
         df['future_return'] = df['close'].shift(-PREDICT_HORIZON) / df['close'] - 1
@@ -339,6 +352,37 @@ class FeatureEngineer:
                               'day_of_week', 'hour', 'minute', 'vwap']]
         logger.info(f"特征数量: {len(self.feature_names)}")
 
+        return df
+
+    def rebuild_dynamic_features(self, df: pd.DataFrame, train_end_idx: int) -> pd.DataFrame:
+        """重新检测周期并重建动态特征 (用于滚动回测每个窗口)
+
+        1. 删除已有的dyn_*列
+        2. 只用[:train_end_idx]检测主导周期
+        3. 在全量df上生成新的动态特征
+        4. 更新feature_names
+        """
+        if not DYNAMIC_PERIODS_ENABLED:
+            return df
+
+        # 删除旧的动态特征列
+        dyn_cols = [c for c in df.columns if c.startswith('dyn_')]
+        if dyn_cols:
+            df = df.drop(columns=dyn_cols)
+
+        # 重新检测
+        detected = self._detect_dominant_periods(df, end_idx=train_end_idx)
+        if detected:
+            df = self._add_dynamic_period_features(df, detected)
+            self._detected_periods = detected
+        else:
+            self._detected_periods = []
+
+        # 更新feature_names
+        self.feature_names = [c for c in df.columns if c not in
+                             ['datetime', 'date', 'time', 'open', 'high', 'low', 'close',
+                              'volume', 'amount', 'future_return', 'label',
+                              'day_of_week', 'hour', 'minute', 'vwap']]
         return df
 
     # ============ 特征选择 ============
