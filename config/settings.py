@@ -30,11 +30,11 @@ DATA_START_DATE = "20220101"
 DATA_END_DATE = "20250207"
 
 # ============ 特征工程设置 ============
-# 技术指标参数
-MA_PERIODS = [5, 10, 20, 60]  # 均线周期
-EMA_PERIODS = [5, 10, 20, 60]
-RSI_PERIODS = [6, 12, 24]
-MACD_PARAMS = (12, 26, 9)  # fast, slow, signal
+# 技术指标参数 (5min bars: 12=1hr, 48=1day, 240=1week)
+MA_PERIODS = [5, 10, 20, 48, 96, 240]        # 25min, 50min, 1.7hr, 1day, 2day, 1week
+EMA_PERIODS = [5, 12, 24, 48, 96]             # 25min, 1hr, 2hr, 1day, 2day
+RSI_PERIODS = [6, 12, 24, 48]                 # 30min, 1hr, 2hr, 1day
+MACD_PARAMS = (12, 26, 9)                     # fast, slow, signal
 BOLL_PERIOD = 20
 BOLL_STD = 2
 ATR_PERIOD = 14
@@ -45,14 +45,20 @@ MFI_PERIOD = 14
 OBV_ENABLED = True
 VWAP_ENABLED = True
 
+# 动态周期检测
+DYNAMIC_PERIODS_ENABLED = True       # 启用自动周期检测
+DYNAMIC_PERIODS_MAX = 5              # 最多检测5个主导周期
+DYNAMIC_PERIODS_RANGE = (6, 480)     # 搜索范围: 30min ~ 10天
+DYNAMIC_PERIODS_MIN_STRENGTH = 0.02  # 最小自相关强度
+
 # 时序特征
-LOOKBACK_WINDOW = 60  # 历史回看窗口(60个5分钟K线 = 5小时)
-PREDICT_HORIZON = 6   # 预测未来6个周期(30分钟)
-SEQUENCE_LENGTH = 30  # 模型输入序列长度
+LOOKBACK_WINDOW = 120  # 历史回看窗口(120个5分钟K线 = 10小时)
+PREDICT_HORIZON = 6    # 预测未来6个周期(30分钟)
+SEQUENCE_LENGTH = 60   # 模型输入序列长度 (扩大以容纳更长周期)
 
 # 特征选择
 FEATURE_SELECTION_METHOD = "mutual_info"  # mutual_info, f_classif, random_forest
-MAX_FEATURES = 50  # 最大特征数
+MAX_FEATURES = 80  # 最大特征数 (扩大以容纳多尺度特征)
 
 # ============ 模型设置 ============
 # 通用设置

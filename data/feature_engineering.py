@@ -17,7 +17,9 @@ from config.settings import (
     MA_PERIODS, EMA_PERIODS, RSI_PERIODS, MACD_PARAMS, BOLL_PERIOD, BOLL_STD,
     ATR_PERIOD, KDJ_PARAMS, CCI_PERIOD, WILLIAMS_PERIOD, MFI_PERIOD,
     LOOKBACK_WINDOW, PREDICT_HORIZON, SEQUENCE_LENGTH, MAX_FEATURES,
-    FEATURE_SELECTION_METHOD, FEATURES_DIR
+    FEATURE_SELECTION_METHOD, FEATURES_DIR,
+    DYNAMIC_PERIODS_ENABLED, DYNAMIC_PERIODS_MAX,
+    DYNAMIC_PERIODS_RANGE, DYNAMIC_PERIODS_MIN_STRENGTH
 )
 from utils.logger import get_logger
 from utils.helpers import ensure_dir
@@ -135,7 +137,7 @@ class FeatureEngineer:
         df['obv_slope'] = obv.pct_change(5)
 
         # 成交量均线
-        for p in [5, 10, 20]:
+        for p in [5, 10, 20, 48]:
             df[f'vol_ma_{p}'] = df['volume'].rolling(p).mean()
         df['vol_ratio'] = df['volume'] / (df['vol_ma_5'] + 1e-10)
 
@@ -161,12 +163,12 @@ class FeatureEngineer:
 
     def _add_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """价格衍生特征 (全部比率化)"""
-        # 收益率
-        for p in [1, 3, 5, 10, 20]:
+        # 收益率 (扩展到多日尺度)
+        for p in [1, 3, 5, 10, 20, 48, 96]:
             df[f'return_{p}'] = df['close'].pct_change(p)
 
-        # 波动率
-        for p in [5, 10, 20]:
+        # 波动率 (扩展到多日尺度)
+        for p in [5, 10, 20, 48, 96]:
             df[f'volatility_{p}'] = df['close'].pct_change().rolling(p).std()
 
         # K线形态特征 (已是比率)
@@ -175,9 +177,9 @@ class FeatureEngineer:
         df['lower_shadow'] = (df[['open', 'close']].min(axis=1) - df['low']) / (df['open'] + 1e-10)
         df['body_ratio'] = np.abs(df['close'] - df['open']) / (df['high'] - df['low'] + 1e-10)
 
-        # 价格动量 (比率化)
-        df['roc_5'] = df['close'].pct_change(5)
-        df['roc_10'] = df['close'].pct_change(10)
+        # 价格动量 (比率化, 多尺度)
+        for p in [5, 10, 20, 48]:
+            df[f'roc_{p}'] = df['close'].pct_change(p)
 
         return df
 
@@ -202,6 +204,97 @@ class FeatureEngineer:
 
         return df
 
+    # ============ 动态周期检测 ============
+
+    def _detect_dominant_periods(self, df: pd.DataFrame) -> list:
+        """用自相关检测价格收益率的主导周期"""
+        returns = df['close'].pct_change().dropna().values
+        if len(returns) < 500:
+            logger.info("数据量不足，跳过动态周期检测")
+            return []
+
+        min_lag, max_lag = DYNAMIC_PERIODS_RANGE
+        max_lag = min(max_lag, len(returns) // 3)
+        if max_lag <= min_lag:
+            return []
+
+        # 计算自相关
+        n = len(returns)
+        mean = np.mean(returns)
+        var = np.var(returns)
+        if var < 1e-12:
+            return []
+
+        autocorr = np.correlate(returns - mean, returns - mean, mode='full')
+        autocorr = autocorr[n - 1:] / (var * n)
+        autocorr = autocorr[min_lag:max_lag + 1]
+        lags = np.arange(min_lag, max_lag + 1)
+
+        # 找局部极大值
+        peaks = []
+        for i in range(1, len(autocorr) - 1):
+            if (autocorr[i] > autocorr[i - 1] and
+                autocorr[i] > autocorr[i + 1] and
+                autocorr[i] >= DYNAMIC_PERIODS_MIN_STRENGTH):
+                peaks.append((lags[i], autocorr[i]))
+
+        # 按强度排序取top
+        peaks.sort(key=lambda x: x[1], reverse=True)
+        # 去除与静态周期太接近的 (差距<20%)
+        static_periods = set(MA_PERIODS + EMA_PERIODS + RSI_PERIODS)
+        detected = []
+        for lag, strength in peaks:
+            too_close = any(abs(lag - sp) / max(sp, 1) < 0.2 for sp in static_periods)
+            if not too_close:
+                detected.append(lag)
+                if len(detected) >= DYNAMIC_PERIODS_MAX:
+                    break
+
+        if detected:
+            logger.info(f"检测到主导周期: {detected}")
+        return detected
+
+    def _add_dynamic_period_features(self, df: pd.DataFrame, periods: list) -> pd.DataFrame:
+        """为动态检测到的周期生成特征"""
+        for p in periods:
+            # MA ratio
+            ma = df['close'].rolling(window=p, min_periods=p // 2).mean()
+            df[f'dyn_ma_{p}_ratio'] = df['close'] / (ma + 1e-10)
+            # RSI
+            delta = df['close'].diff()
+            gain = delta.where(delta > 0, 0).rolling(window=p, min_periods=p // 2).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=p, min_periods=p // 2).mean()
+            rs = gain / (loss + 1e-10)
+            df[f'dyn_rsi_{p}'] = 100 - (100 / (1 + rs))
+            # Volatility
+            df[f'dyn_volatility_{p}'] = df['close'].pct_change().rolling(p, min_periods=p // 2).std()
+            # Return
+            df[f'dyn_return_{p}'] = df['close'].pct_change(p)
+        return df
+
+    # ============ 多尺度特征 ============
+
+    def _add_multiscale_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """跨时间尺度的复合特征"""
+        # 短期vs长期波动率比
+        vol_short = df['close'].pct_change().rolling(12).std()   # 1hr
+        vol_long = df['close'].pct_change().rolling(96).std()    # 2day
+        df['vol_ratio_short_long'] = vol_short / (vol_long + 1e-10)
+
+        # 短期vs长期均线动量比
+        ma_12 = df['close'].rolling(12).mean()
+        ma_96 = df['close'].rolling(96).mean()
+        df['ma_momentum_ratio'] = (df['close'] / ma_12) / (df['close'] / (ma_96 + 1e-10) + 1e-10)
+
+        # 多尺度RSI差异 (短期RSI - 长期RSI)
+        for short_p, long_p in [(6, 24), (12, 48)]:
+            rsi_s = df.get(f'rsi_{short_p}')
+            rsi_l = df.get(f'rsi_{long_p}')
+            if rsi_s is not None and rsi_l is not None:
+                df[f'rsi_diff_{short_p}_{long_p}'] = rsi_s - rsi_l
+
+        return df
+
     # ============ 特征构建主流程 ============
 
     def build_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -222,6 +315,14 @@ class FeatureEngineer:
         df = self._add_volume_indicators(df)
         df = self._add_price_features(df)
         df = self._add_time_features(df)
+        df = self._add_multiscale_features(df)
+
+        # 动态周期检测和特征生成
+        if DYNAMIC_PERIODS_ENABLED:
+            detected_periods = self._detect_dominant_periods(df)
+            if detected_periods:
+                df = self._add_dynamic_period_features(df, detected_periods)
+                self._detected_periods = detected_periods
 
         # 创建标签: 未来N期收益率是否为正
         df['future_return'] = df['close'].shift(-PREDICT_HORIZON) / df['close'] - 1
