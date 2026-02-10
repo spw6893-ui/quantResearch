@@ -98,12 +98,26 @@ MLP_CONFIG = {
     "dropout": 0.3,
 }
 
+# LightGBM模型
+LGBM_CONFIG = {
+    "num_leaves": 63,
+    "max_depth": 8,
+    "learning_rate": 0.05,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "min_child_samples": 50,
+    "lambda_l1": 0.1,
+    "lambda_l2": 0.1,
+}
+
 # 集成模型权重 (初始值，可通过训练调整)
 ENSEMBLE_WEIGHTS = {
-    "transformer_lstm": 0.4,
-    "lstm": 0.25,
-    "cnn": 0.2,
-    "mlp": 0.15,
+    "transformer_lstm": 0.3,
+    "lstm": 0.15,
+    "cnn": 0.1,
+    "mlp": 0.1,
+    "lgbm": 0.35,
 }
 
 # ============ 训练设置 ============

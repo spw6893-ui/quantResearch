@@ -28,16 +28,28 @@ class EnsembleModel:
         total = sum(self.weights.values())
         self.weights = {k: v/total for k, v in self.weights.items()}
 
-    def predict_proba(self, x: torch.Tensor) -> np.ndarray:
+    @staticmethod
+    def _is_lgbm(model):
+        return hasattr(model, 'model_name') and model.model_name == 'lgbm'
+
+    def predict_proba(self, x) -> np.ndarray:
         """集成预测概率 (返回1D数组, 每个元素为上涨概率)"""
+        if isinstance(x, torch.Tensor):
+            x_np = x.numpy()
+        else:
+            x_np = x
+
         all_probs = []
         for name, model in self.models.items():
-            model.eval()
-            with torch.no_grad():
-                x_input = x.to(self.device)
-                logits = model(x_input)
-                probs = torch.sigmoid(logits).cpu().numpy()
-                all_probs.append(probs * self.weights[name])
+            if self._is_lgbm(model):
+                probs = model.predict_proba(x_np)
+            else:
+                model.eval()
+                with torch.no_grad():
+                    x_t = x if isinstance(x, torch.Tensor) else torch.FloatTensor(x)
+                    logits = model(x_t.to(self.device))
+                    probs = torch.sigmoid(logits).cpu().numpy()
+            all_probs.append(probs * self.weights[name])
 
         ensemble_probs = np.sum(all_probs, axis=0)
         return ensemble_probs

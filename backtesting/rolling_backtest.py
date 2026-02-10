@@ -56,7 +56,7 @@ class RollingBacktest:
         """训练全部4个模型并返回集成"""
         models = {}
 
-        for mt in ["transformer_lstm", "lstm", "cnn", "mlp"]:
+        for mt in ["lgbm", "transformer_lstm", "lstm", "cnn", "mlp"]:
             try:
                 model, metrics = trainer.train_model(
                     mt, X_tr, y_tr, X_val, y_val, config=quick_config

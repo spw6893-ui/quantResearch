@@ -32,6 +32,7 @@ from models.transformer_lstm import TransformerLSTM
 from models.lstm_model import LSTMModel
 from models.cnn_model import CNNModel
 from models.mlp_model import MLPModel
+from models.lgbm_model import LGBMModel
 from analysis.interpretability import ModelInterpreter
 from backtesting.backtest_engine import BacktestEngine
 from backtesting.rolling_backtest import RollingBacktest
@@ -250,6 +251,18 @@ def step_backtest(results=None, X=None, y=None, ts=None, feature_names=None):
             model.load_state_dict(torch.load(model_path, map_location=device))
             models[name] = model
             logger.info(f"加载模型: {name}")
+
+    # LightGBM
+    if results and 'lgbm' in results and results['lgbm']['best_model'] is not None:
+        models['lgbm'] = results['lgbm']['best_model']
+    else:
+        lgbm_path = os.path.join(MODEL_DIR, "lgbm_best.txt")
+        if os.path.exists(lgbm_path):
+            import lightgbm as lgb_lib
+            lgbm = LGBMModel()
+            lgbm.model = lgb_lib.Booster(model_file=lgbm_path)
+            models['lgbm'] = lgbm
+            logger.info("加载模型: lgbm")
 
     if not models:
         logger.warning("没有可用的模型，使用随机预测进行回测演示")
