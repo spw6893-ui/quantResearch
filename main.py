@@ -340,12 +340,37 @@ def main():
         X, y, ts, fe = step_feature(df)
         results = step_train(X, y, use_optuna=args.optuna)
         step_analysis(results, X, y, fe.selected_features)
-        step_backtest(results, X, y, ts, fe.selected_features)
+        bt_result = step_backtest(results, X, y, ts, fe.selected_features)
 
-        logger.info("\n" + "=" * 60)
-        logger.info("全部流程执行完毕!")
-        logger.info(f"结果目录: {RESULTS_DIR}")
-        logger.info("=" * 60)
+        # 打印最终汇总
+        print("\n" + "=" * 70)
+        print("                    最终结果汇总")
+        print("=" * 70)
+        print(f"\n数据: {SYMBOL_NAME}({SYMBOL}), {BAR_INTERVAL}K线")
+        print(f"预测周期: {PREDICT_HORIZON} bars ({PREDICT_HORIZON*5}分钟)")
+        print(f"序列长度: {SEQUENCE_LENGTH}, 特征数: {len(fe.selected_features)}")
+        print(f"样本量: {len(X)}, 标签分布: 涨{(y==1).sum()}({(y==1).mean()*100:.1f}%) 跌{(y==0).sum()}({(y==0).mean()*100:.1f}%)")
+
+        print(f"\n--- 模型训练结果 (5-fold 时序CV) ---")
+        print(f"{'模型':<25s} {'Avg Test AUC':>12s} {'Avg Test Acc':>12s}")
+        print("-" * 50)
+        for mt, res in results.items():
+            print(f"{mt:<25s} {res['avg_test_auc']:>12.4f} {res['avg_test_acc']:>12.4f}")
+
+        if bt_result:
+            print(f"\n--- 回测结果 ---")
+            for key in ['total_return', 'annual_return', 'sharpe_ratio',
+                        'sortino_ratio', 'max_drawdown', 'calmar_ratio',
+                        'total_trades', 'win_rate']:
+                if key in bt_result:
+                    val = bt_result[key]
+                    if isinstance(val, float):
+                        print(f"  {key}: {val:.4f}")
+                    else:
+                        print(f"  {key}: {val}")
+
+        print(f"\n结果目录: {RESULTS_DIR}")
+        print("=" * 70)
 
 
 if __name__ == "__main__":
