@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import (
     TRAINING_CONFIG, CV_CONFIG, OPTUNA_CONFIG, MODEL_DIR,
     TRANSFORMER_LSTM_CONFIG, LSTM_CONFIG, CNN_CONFIG, MLP_CONFIG,
-    SEQUENCE_LENGTH, DEVICE, RANDOM_SEED, NUM_CLASSES
+    SEQUENCE_LENGTH, DEVICE, RANDOM_SEED
 )
 from models.transformer_lstm import TransformerLSTM
 from models.lstm_model import LSTMModel
@@ -31,28 +31,32 @@ logger = get_logger(__name__, "training.log")
 
 
 class TimeSeriesSplitter:
-    """时间序列交叉验证分割器"""
+    """时间序列交叉验证分割器 (expanding window)"""
 
-    def __init__(self, n_splits=5, train_ratio=0.7, val_ratio=0.15,
-                 test_ratio=0.15, gap=10):
+    def __init__(self, n_splits=5, gap=10, val_ratio=0.15, test_ratio=0.15):
         self.n_splits = n_splits
-        self.train_ratio = train_ratio
+        self.gap = gap
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
-        self.gap = gap
 
     def split(self, n_samples):
-        """生成时间序列交叉验证的索引"""
-        fold_size = n_samples // self.n_splits
+        """生成expanding window交叉验证索引"""
         splits = []
+        val_size = int(n_samples * self.val_ratio)
+        test_size = int(n_samples * self.test_ratio)
+        block_size = val_size + test_size + 2 * self.gap
+        usable = n_samples - block_size
+        step = max(usable // self.n_splits, 1)
 
         for i in range(self.n_splits):
-            # 扩展窗口: 训练集从头开始到当前fold
-            train_end = int(fold_size * (i + 1) * self.train_ratio)
+            train_end = step * (i + 1)
+            if train_end < 100:
+                continue
+
             val_start = train_end + self.gap
-            val_end = val_start + int(fold_size * self.val_ratio)
+            val_end = val_start + val_size
             test_start = val_end + self.gap
-            test_end = min(test_start + int(fold_size * self.test_ratio), n_samples)
+            test_end = min(test_start + test_size, n_samples)
 
             if test_end > n_samples or val_end > n_samples:
                 continue
@@ -61,7 +65,7 @@ class TimeSeriesSplitter:
             val_idx = list(range(val_start, val_end))
             test_idx = list(range(test_start, test_end))
 
-            if len(train_idx) > 0 and len(val_idx) > 0 and len(test_idx) > 0:
+            if len(train_idx) > 100 and len(val_idx) > 10 and len(test_idx) > 10:
                 splits.append((train_idx, val_idx, test_idx))
 
         return splits
@@ -122,7 +126,6 @@ class ModelTrainer:
                 lstm_num_layers=config['lstm_num_layers'],
                 dropout=config['dropout'],
                 fc_hidden_size=config['fc_hidden_size'],
-                num_classes=NUM_CLASSES
             )
         elif model_type == "lstm":
             config = {**LSTM_CONFIG, **kwargs}
@@ -132,7 +135,6 @@ class ModelTrainer:
                 num_layers=config['num_layers'],
                 dropout=config['dropout'],
                 fc_hidden_size=config['fc_hidden_size'],
-                num_classes=NUM_CLASSES
             )
         elif model_type == "cnn":
             config = {**CNN_CONFIG, **kwargs}
@@ -143,7 +145,6 @@ class ModelTrainer:
                 kernel_sizes=config['kernel_sizes'],
                 dropout=config['dropout'],
                 fc_hidden_size=config['fc_hidden_size'],
-                num_classes=NUM_CLASSES
             )
         elif model_type == "mlp":
             config = {**MLP_CONFIG, **kwargs}
@@ -152,12 +153,19 @@ class ModelTrainer:
                 seq_length=seq_length,
                 hidden_sizes=config['hidden_sizes'],
                 dropout=config['dropout'],
-                num_classes=NUM_CLASSES
             )
         else:
             raise ValueError(f"未知模型类型: {model_type}")
 
         return model.to(self.device)
+
+    def _compute_pos_weight(self, y):
+        """计算正样本权重用于不平衡标签校正"""
+        n_pos = np.sum(y == 1)
+        n_neg = np.sum(y == 0)
+        if n_pos == 0 or n_neg == 0:
+            return None
+        return torch.tensor([n_neg / n_pos], dtype=torch.float32).to(self.device)
 
     def train_epoch(self, model, train_loader, criterion, optimizer, clip_norm=1.0):
         """训练一个epoch"""
@@ -225,7 +233,7 @@ class ModelTrainer:
         logger.info(f"训练 {model_type} 模型: input_size={input_size}, seq_length={seq_length}")
         logger.info(f"  模型参数量: {sum(p.numel() for p in model.parameters()):,}")
 
-        # 数据加载器
+        # 数据加载器 (只有训练集用drop_last)
         train_dataset = TensorDataset(
             torch.FloatTensor(X_train), torch.FloatTensor(y_train.astype(np.float32))
         )
@@ -233,10 +241,11 @@ class ModelTrainer:
             torch.FloatTensor(X_val), torch.FloatTensor(y_val.astype(np.float32))
         )
         train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True)
-        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], drop_last=False)
 
-        # 损失函数和优化器 (BCE用于二分类单输出)
-        criterion = nn.BCEWithLogitsLoss()
+        # 损失函数 (带pos_weight校正标签不平衡)
+        pos_weight = self._compute_pos_weight(y_train)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         optimizer = torch.optim.Adam(
             model.parameters(),
             lr=config['learning_rate'],
@@ -294,10 +303,9 @@ class ModelTrainer:
 
         splitter = TimeSeriesSplitter(
             n_splits=cv_config['n_splits'],
-            train_ratio=cv_config['train_ratio'],
+            gap=cv_config['gap'],
             val_ratio=cv_config['val_ratio'],
             test_ratio=cv_config['test_ratio'],
-            gap=cv_config['gap']
         )
         splits = splitter.split(len(X))
 
@@ -319,11 +327,11 @@ class ModelTrainer:
                 model_type, X_train, y_train, X_val, y_val
             )
 
-            # 在测试集上评估
+            # 在测试集上评估 (不用drop_last)
             test_dataset = TensorDataset(
                 torch.FloatTensor(X_test), torch.FloatTensor(y_test.astype(np.float32))
             )
-            test_loader = DataLoader(test_dataset, batch_size=TRAINING_CONFIG['batch_size'], drop_last=True)
+            test_loader = DataLoader(test_dataset, batch_size=TRAINING_CONFIG['batch_size'], drop_last=False)
             criterion = nn.BCEWithLogitsLoss()
             _, test_auc, test_acc, test_preds, test_labels = self.evaluate(
                 model, test_loader, criterion
@@ -362,7 +370,6 @@ class ModelTrainer:
         if n_trials is None:
             n_trials = OPTUNA_CONFIG['n_trials']
 
-        # 简单的train/val划分用于超参数搜索
         split_idx = int(len(X) * 0.7)
         gap = CV_CONFIG['gap']
         val_end = int(len(X) * 0.85)
@@ -376,7 +383,6 @@ class ModelTrainer:
         seq_length = X.shape[1]
 
         def objective(trial):
-            # 训练超参数
             config = {
                 'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128]),
                 'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True),
@@ -389,7 +395,6 @@ class ModelTrainer:
                 'gradient_clip_norm': 1.0,
             }
 
-            # 模型架构超参数
             dropout = trial.suggest_float('dropout', 0.1, 0.5)
 
             if model_type == "transformer_lstm":
@@ -449,10 +454,11 @@ class ModelTrainer:
                     train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True
                 )
                 val_loader = DataLoader(
-                    val_dataset, batch_size=config['batch_size'], drop_last=True
+                    val_dataset, batch_size=config['batch_size'], drop_last=False
                 )
 
-                criterion = nn.BCEWithLogitsLoss()
+                pos_weight = self._compute_pos_weight(y_train)
+                criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
                 optimizer = torch.optim.Adam(
                     model.parameters(),
                     lr=config['learning_rate'],
@@ -504,8 +510,41 @@ class ModelTrainer:
             'study': study
         }
 
-    def train_all_models(self, X, y) -> dict:
-        """训练所有模型并返回结果"""
+    @staticmethod
+    def _extract_arch_params(model_type, params):
+        """从Optuna best_params中提取架构参数(去除训练参数)"""
+        training_keys = {'batch_size', 'learning_rate', 'weight_decay'}
+        arch = {k: v for k, v in params.items() if k not in training_keys}
+        if model_type == 'cnn' and 'n_conv_layers' in arch:
+            n = arch.pop('n_conv_layers')
+            arch['num_filters'] = [arch.pop(f'filters_{i}') for i in range(n)]
+            arch['kernel_sizes'] = [3] * n
+        if model_type == 'mlp' and 'n_layers' in arch:
+            n = arch.pop('n_layers')
+            arch['hidden_sizes'] = [arch.pop(f'hidden_{i}') for i in range(n)]
+        return arch
+
+    def train_all_models(self, X, y, optuna_params: dict = None) -> dict:
+        """训练所有模型并返回结果
+
+        Args:
+            optuna_params: {model_type: best_params} 从Optuna优化得到的参数
+        """
+        # 将Optuna最佳参数写入全局配置
+        if optuna_params:
+            import config.settings as cfg
+            for mt, params in optuna_params.items():
+                arch = self._extract_arch_params(mt, params)
+                if mt == 'transformer_lstm':
+                    cfg.TRANSFORMER_LSTM_CONFIG.update(arch)
+                elif mt == 'lstm':
+                    cfg.LSTM_CONFIG.update(arch)
+                elif mt == 'cnn':
+                    cfg.CNN_CONFIG.update(arch)
+                elif mt == 'mlp':
+                    cfg.MLP_CONFIG.update(arch)
+                logger.info(f"  {mt} 应用Optuna架构参数: {arch}")
+
         model_types = ["transformer_lstm", "lstm", "cnn", "mlp"]
         results = {}
 
@@ -538,17 +577,14 @@ if __name__ == "__main__":
     from data.data_loader import DataLoader as DL
     from data.feature_engineering import FeatureEngineer
 
-    # 加载数据
     loader = DL()
     df = loader.prepare_data()
 
-    # 特征工程
     fe = FeatureEngineer()
     df = fe.build_features(df)
     selected = fe.select_features(df)
     X, y, ts = fe.create_sequences(df)
 
-    # 训练
     trainer = ModelTrainer()
     results = trainer.train_all_models(X, y)
 

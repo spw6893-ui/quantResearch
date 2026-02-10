@@ -34,7 +34,7 @@ class TransformerLSTM(nn.Module):
     def __init__(self, input_size: int, d_model: int = 64, nhead: int = 4,
                  num_transformer_layers: int = 2, lstm_hidden_size: int = 128,
                  lstm_num_layers: int = 2, dropout: float = 0.3,
-                 fc_hidden_size: int = 64, num_classes: int = 2):
+                 fc_hidden_size: int = 64, **kwargs):
         super().__init__()
         self.model_name = "transformer_lstm"
 

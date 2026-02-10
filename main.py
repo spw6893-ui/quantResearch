@@ -46,7 +46,6 @@ def step_data():
     logger.info("=" * 60)
 
     loader = DataLoader()
-    # 优先加载本地已有数据，避免重复拉取
     df = loader.prepare_data()
     if len(df) == 0:
         logger.warning("本地无数据，尝试远程获取...")
@@ -116,13 +115,15 @@ def step_train(X=None, y=None, use_optuna=False):
 
     trainer = ModelTrainer()
 
+    optuna_params = {}
     if use_optuna:
         logger.info("使用Optuna进行超参数优化...")
         for mt in ["transformer_lstm", "lstm"]:
             opt_result = trainer.optimize_hyperparams(mt, X, y, n_trials=20)
             logger.info(f"{mt} 最佳参数: {opt_result['best_params']}")
+            optuna_params[mt] = opt_result['best_params']
 
-    results = trainer.train_all_models(X, y)
+    results = trainer.train_all_models(X, y, optuna_params=optuna_params if optuna_params else None)
 
     # 打印汇总
     logger.info("\n" + "=" * 60)

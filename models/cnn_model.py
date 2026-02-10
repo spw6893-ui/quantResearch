@@ -1,17 +1,34 @@
 """
-CNN时序分类模型
+CNN时序分类模型 (带残差连接)
 """
 import torch
 import torch.nn as nn
 
 
+class ResidualConvBlock(nn.Module):
+    """带残差连接的Conv1d块"""
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, dropout=0.3):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size // 2)
+        self.bn = nn.BatchNorm1d(out_channels)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.residual_proj = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x):
+        residual = self.residual_proj(x)
+        out = self.drop(self.act(self.bn(self.conv(x))))
+        return out + residual
+
+
 class CNNModel(nn.Module):
-    """1D CNN用于时序分类"""
+    """1D CNN用于时序分类 (带残差连接)"""
 
     def __init__(self, input_size: int, seq_length: int = 30,
                  num_filters: list = None, kernel_sizes: list = None,
                  dropout: float = 0.3, fc_hidden_size: int = 64,
-                 num_classes: int = 2):
+                 **kwargs):
         super().__init__()
         self.model_name = "cnn"
         if num_filters is None:
@@ -19,18 +36,13 @@ class CNNModel(nn.Module):
         if kernel_sizes is None:
             kernel_sizes = [3, 3, 3]
 
-        layers = []
+        blocks = []
         in_channels = input_size
-        for i, (nf, ks) in enumerate(zip(num_filters, kernel_sizes)):
-            layers.extend([
-                nn.Conv1d(in_channels, nf, kernel_size=ks, padding=ks//2),
-                nn.BatchNorm1d(nf),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
+        for nf, ks in zip(num_filters, kernel_sizes):
+            blocks.append(ResidualConvBlock(in_channels, nf, ks, dropout))
             in_channels = nf
 
-        self.conv_layers = nn.Sequential(*layers)
+        self.conv_layers = nn.Sequential(*blocks)
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
         # 单输出用于BCE

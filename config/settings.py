@@ -59,8 +59,6 @@ MAX_FEATURES = 50  # 最大特征数
 RANDOM_SEED = 42
 import torch as _torch
 DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
-NUM_CLASSES = 2  # 二分类: 涨/跌
-
 # Transformer-LSTM混合模型
 TRANSFORMER_LSTM_CONFIG = {
     "d_model": 64,
@@ -118,7 +116,6 @@ TRAINING_CONFIG = {
 # 时间序列交叉验证
 CV_CONFIG = {
     "n_splits": 5,
-    "train_ratio": 0.7,  # 每个fold中训练集比例
     "val_ratio": 0.15,
     "test_ratio": 0.15,
     "gap": 10,  # 训练集和验证集之间的间隔(防止数据泄露)

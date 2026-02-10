@@ -37,23 +37,25 @@ class FeatureEngineer:
     # ============ 技术指标 ============
 
     def _add_ma(self, df: pd.DataFrame) -> pd.DataFrame:
-        """移动平均线"""
+        """移动平均线 (只保留比率特征，去除绝对价格)"""
         for p in MA_PERIODS:
-            df[f'ma_{p}'] = df['close'].rolling(window=p).mean()
-            df[f'ma_{p}_slope'] = df[f'ma_{p}'].pct_change(5)
-            df[f'close_ma_{p}_ratio'] = df['close'] / df[f'ma_{p}']
-        # 均线交叉信号
+            ma = df['close'].rolling(window=p).mean()
+            df[f'close_ma_{p}_ratio'] = df['close'] / ma
+            df[f'ma_{p}_slope'] = ma.pct_change(5)
+        # 均线交叉信号 (用比率)
         for i in range(len(MA_PERIODS)):
             for j in range(i+1, len(MA_PERIODS)):
                 short, long = MA_PERIODS[i], MA_PERIODS[j]
-                df[f'ma_cross_{short}_{long}'] = df[f'ma_{short}'] - df[f'ma_{long}']
+                ma_s = df['close'].rolling(window=short).mean()
+                ma_l = df['close'].rolling(window=long).mean()
+                df[f'ma_cross_{short}_{long}'] = (ma_s - ma_l) / (ma_l + 1e-10)
         return df
 
     def _add_ema(self, df: pd.DataFrame) -> pd.DataFrame:
-        """指数移动平均线"""
+        """指数移动平均线 (只保留比率特征)"""
         for p in EMA_PERIODS:
-            df[f'ema_{p}'] = df['close'].ewm(span=p, adjust=False).mean()
-            df[f'close_ema_{p}_ratio'] = df['close'] / df[f'ema_{p}']
+            ema = df['close'].ewm(span=p, adjust=False).mean()
+            df[f'close_ema_{p}_ratio'] = df['close'] / ema
         return df
 
     def _add_rsi(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -75,17 +77,19 @@ class FeatureEngineer:
         df['macd_signal'] = df['macd'].ewm(span=signal, adjust=False).mean()
         df['macd_hist'] = df['macd'] - df['macd_signal']
         df['macd_cross'] = np.sign(df['macd_hist'])
+        # 归一化MACD为比率
+        df['macd_ratio'] = df['macd'] / (df['close'] + 1e-10)
+        df['macd_hist_ratio'] = df['macd_hist'] / (df['close'] + 1e-10)
         return df
 
     def _add_bollinger(self, df: pd.DataFrame) -> pd.DataFrame:
-        """布林带"""
+        """布林带 (只保留归一化特征)"""
         ma = df['close'].rolling(window=BOLL_PERIOD).mean()
         std = df['close'].rolling(window=BOLL_PERIOD).std()
-        df['boll_upper'] = ma + BOLL_STD * std
-        df['boll_lower'] = ma - BOLL_STD * std
-        df['boll_mid'] = ma
-        df['boll_width'] = (df['boll_upper'] - df['boll_lower']) / df['boll_mid']
-        df['boll_pct'] = (df['close'] - df['boll_lower']) / (df['boll_upper'] - df['boll_lower'] + 1e-10)
+        boll_upper = ma + BOLL_STD * std
+        boll_lower = ma - BOLL_STD * std
+        df['boll_width'] = (boll_upper - boll_lower) / (ma + 1e-10)
+        df['boll_pct'] = (df['close'] - boll_lower) / (boll_upper - boll_lower + 1e-10)
         return df
 
     def _add_atr(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -126,19 +130,25 @@ class FeatureEngineer:
 
     def _add_volume_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """成交量指标"""
-        # OBV
-        df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
-        df['obv_ma5'] = df['obv'].rolling(5).mean()
-        df['obv_slope'] = df['obv'].pct_change(5)
+        # OBV slope (比率化，不用绝对OBV)
+        obv = (np.sign(df['close'].diff()) * df['volume']).cumsum()
+        df['obv_slope'] = obv.pct_change(5)
 
         # 成交量均线
         for p in [5, 10, 20]:
             df[f'vol_ma_{p}'] = df['volume'].rolling(p).mean()
         df['vol_ratio'] = df['volume'] / (df['vol_ma_5'] + 1e-10)
 
-        # VWAP
-        df['vwap'] = (df['amount'].cumsum()) / (df['volume'].cumsum() + 1e-10)
-        df['close_vwap_ratio'] = df['close'] / (df['vwap'] + 1e-10)
+        # VWAP (按日reset)
+        if 'datetime' in df.columns:
+            df['_date'] = df['datetime'].dt.date
+            df['vwap'] = df.groupby('_date').apply(
+                lambda g: g['amount'].cumsum() / (g['volume'].cumsum() + 1e-10)
+            ).reset_index(level=0, drop=True)
+            df['close_vwap_ratio'] = df['close'] / (df['vwap'] + 1e-10)
+            df.drop(columns=['_date'], inplace=True)
+        else:
+            df['close_vwap_ratio'] = 1.0
 
         # MFI
         tp = (df['high'] + df['low'] + df['close']) / 3
@@ -150,7 +160,7 @@ class FeatureEngineer:
         return df
 
     def _add_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """价格衍生特征"""
+        """价格衍生特征 (全部比率化)"""
         # 收益率
         for p in [1, 3, 5, 10, 20]:
             df[f'return_{p}'] = df['close'].pct_change(p)
@@ -159,15 +169,13 @@ class FeatureEngineer:
         for p in [5, 10, 20]:
             df[f'volatility_{p}'] = df['close'].pct_change().rolling(p).std()
 
-        # K线形态特征
+        # K线形态特征 (已是比率)
         df['body'] = (df['close'] - df['open']) / (df['open'] + 1e-10)
         df['upper_shadow'] = (df['high'] - df[['open', 'close']].max(axis=1)) / (df['open'] + 1e-10)
         df['lower_shadow'] = (df[['open', 'close']].min(axis=1) - df['low']) / (df['open'] + 1e-10)
         df['body_ratio'] = np.abs(df['close'] - df['open']) / (df['high'] - df['low'] + 1e-10)
 
-        # 价格动量
-        df['momentum_5'] = df['close'] - df['close'].shift(5)
-        df['momentum_10'] = df['close'] - df['close'].shift(10)
+        # 价格动量 (比率化)
         df['roc_5'] = df['close'].pct_change(5)
         df['roc_10'] = df['close'].pct_change(10)
 
@@ -215,7 +223,7 @@ class FeatureEngineer:
         df = self._add_price_features(df)
         df = self._add_time_features(df)
 
-        # 创建标签: 未来1期收益率是否为正
+        # 创建标签: 未来N期收益率是否为正
         df['future_return'] = df['close'].shift(-PREDICT_HORIZON) / df['close'] - 1
         df['label'] = (df['future_return'] > 0).astype(int)
 
@@ -227,7 +235,7 @@ class FeatureEngineer:
         self.feature_names = [c for c in df.columns if c not in
                              ['datetime', 'date', 'time', 'open', 'high', 'low', 'close',
                               'volume', 'amount', 'future_return', 'label',
-                              'day_of_week', 'hour', 'minute']]
+                              'day_of_week', 'hour', 'minute', 'vwap']]
         logger.info(f"特征数量: {len(self.feature_names)}")
 
         return df
@@ -235,12 +243,18 @@ class FeatureEngineer:
     # ============ 特征选择 ============
 
     def select_features(self, df: pd.DataFrame, method: str = FEATURE_SELECTION_METHOD,
-                       max_features: int = MAX_FEATURES) -> list:
-        """特征选择"""
+                       max_features: int = MAX_FEATURES,
+                       train_end_idx: int = None) -> list:
+        """特征选择 (只用训练集部分避免数据泄露)"""
         logger.info(f"开始特征选择 (方法: {method}, 最大特征数: {max_features})")
 
-        X = df[self.feature_names].values
-        y = df['label'].values
+        # 只用训练集做特征选择，避免数据泄露
+        if train_end_idx is None:
+            train_end_idx = int(len(df) * 0.7)
+        df_train = df.iloc[:train_end_idx]
+
+        X = df_train[self.feature_names].values
+        y = df_train['label'].values
 
         # 替换inf和nan
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
@@ -281,8 +295,12 @@ class FeatureEngineer:
     # ============ 序列构建 ============
 
     def create_sequences(self, df: pd.DataFrame, feature_cols: list = None,
-                        seq_length: int = SEQUENCE_LENGTH) -> tuple:
+                        seq_length: int = SEQUENCE_LENGTH,
+                        train_end_idx: int = None) -> tuple:
         """创建时序序列数据用于模型输入
+
+        Args:
+            train_end_idx: scaler只在[:train_end_idx]上fit，避免数据泄露
 
         Returns:
             X: shape (n_samples, seq_length, n_features)
@@ -298,9 +316,12 @@ class FeatureEngineer:
         labels = df['label'].values
         timestamps = df['datetime'].values
 
-        # 标准化
+        # 标准化: 只在训练集上fit，避免数据泄露
         data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-        data = self.scaler.fit_transform(data)
+        if train_end_idx is None:
+            train_end_idx = int(len(data) * 0.7)
+        self.scaler.fit(data[:train_end_idx])
+        data = self.scaler.transform(data)
 
         X, y, ts = [], [], []
         for i in range(seq_length, len(data)):

@@ -26,7 +26,6 @@ from models.cnn_model import CNNModel
 from models.mlp_model import MLPModel
 from models.ensemble import EnsembleModel
 from models.trainer import ModelTrainer
-from strategies.t0_strategy import T0Strategy
 from backtesting.backtest_engine import BacktestEngine
 from utils.logger import get_logger
 from utils.helpers import set_seed, ensure_dir
@@ -50,24 +49,38 @@ class RollingBacktest:
         ensure_dir(self.results_dir)
         set_seed(RANDOM_SEED)
 
+    def _train_ensemble(self, trainer, X_tr, y_tr, X_val, y_val, quick_config):
+        """训练全部4个模型并返回集成"""
+        models = {}
+        input_size = X_tr.shape[2]
+        seq_length = X_tr.shape[1]
+
+        for mt in ["transformer_lstm", "lstm", "cnn", "mlp"]:
+            try:
+                model, metrics = trainer.train_model(
+                    mt, X_tr, y_tr, X_val, y_val, config=quick_config
+                )
+                models[mt] = model
+                logger.info(f"    {mt}: val_auc={metrics.get('val_auc', 0):.4f}")
+            except Exception as e:
+                logger.warning(f"    {mt} 训练失败: {e}")
+
+        if not models:
+            return None
+
+        ensemble = EnsembleModel(models, ENSEMBLE_WEIGHTS, DEVICE)
+        return ensemble
+
     def run(self, X: np.ndarray, y: np.ndarray, timestamps: np.ndarray,
             prices_df: pd.DataFrame, feature_names: list = None,
             scaler=None) -> dict:
         """
         执行滚动回测
-
-        Args:
-            X: (n_samples, seq_length, n_features) 全量特征序列
-            y: (n_samples,) 标签
-            timestamps: (n_samples,) 时间戳
-            prices_df: 全量价格DataFrame (需含'close'列)
-            feature_names: 特征名列表
-            scaler: 特征标准化器
         """
         logger.info(f"滚动回测: 训练窗口={self.train_window}天, "
                     f"重训间隔={self.retrain_interval}天")
 
-        bars_per_day = 48  # 5分钟K线，每天约48根
+        bars_per_day = 48
         train_size = self.train_window * bars_per_day
         retrain_size = self.retrain_interval * bars_per_day
         n_total = len(X)
@@ -99,7 +112,7 @@ class RollingBacktest:
             logger.info(f"\n--- 滚动窗口 {window_idx + 1} ---")
             logger.info(f"  训练: [{start}:{train_end}], 测试: [{train_end}:{test_end}]")
 
-            # 训练 (简化: 80/20 分割为 train/val)
+            # 训练 (80/20 分割为 train/val)
             split = int(len(X_train) * 0.8)
             X_tr, y_tr = X_train[:split], y_train[:split]
             X_val, y_val = X_train[split:], y_train[split:]
@@ -111,18 +124,19 @@ class RollingBacktest:
                 'early_stopping_patience': 8,
             }
 
-            # 只训练主模型(Transformer-LSTM)以节省时间
-            model, metrics = trainer.train_model(
-                'transformer_lstm', X_tr, y_tr, X_val, y_val, config=quick_config
-            )
+            # 训练集成模型
+            ensemble = self._train_ensemble(trainer, X_tr, y_tr, X_val, y_val, quick_config)
+
+            if ensemble is None:
+                logger.warning(f"  窗口 {window_idx+1} 无可用模型，跳过")
+                start += retrain_size
+                window_idx += 1
+                continue
 
             # 在测试集上预测
-            model.eval()
-            with torch.no_grad():
-                x_tensor = torch.FloatTensor(X_test).to(DEVICE)
-                logits = model(x_tensor)
-                probs = torch.sigmoid(logits).cpu().numpy()
-                preds = (probs >= T0_CONFIG_THRESHOLD).astype(int)
+            x_tensor = torch.FloatTensor(X_test)
+            probs = ensemble.predict_proba(x_tensor)
+            preds = (probs >= T0_CONFIG_THRESHOLD).astype(int)
 
             all_predictions.extend(preds)
             all_probabilities.extend(probs)
@@ -145,7 +159,6 @@ class RollingBacktest:
 
             logger.info(f"  窗口结果: AUC={test_auc:.4f}, Acc={test_acc:.4f}")
 
-            # 滚动前进
             start += retrain_size
             window_idx += 1
 
@@ -157,7 +170,6 @@ class RollingBacktest:
         # 使用BacktestEngine进行交易模拟
         test_prices = prices_df.iloc[-len(all_predictions):].reset_index(drop=True)
         if len(test_prices) < len(all_predictions):
-            # 截断预测以匹配价格
             all_predictions = all_predictions[:len(test_prices)]
             all_probabilities = all_probabilities[:len(test_prices)]
             all_timestamps = all_timestamps[:len(test_prices)]
@@ -170,7 +182,6 @@ class RollingBacktest:
             timestamps=all_timestamps
         )
 
-        # 保存滚动窗口结果
         self._save_results(window_results, bt_result)
 
         return {
@@ -182,12 +193,10 @@ class RollingBacktest:
 
     def _save_results(self, window_results: list, bt_result: dict):
         """保存结果"""
-        # 窗口结果
         pd.DataFrame(window_results).to_csv(
             os.path.join(self.results_dir, 'window_results.csv'), index=False
         )
 
-        # 绘制窗口AUC变化
         fig, ax = plt.subplots(figsize=(10, 5))
         windows = [r['window'] for r in window_results]
         aucs = [r['test_auc'] for r in window_results]
@@ -204,4 +213,3 @@ class RollingBacktest:
         plt.close()
 
         logger.info(f"滚动回测结果已保存: {self.results_dir}")
-

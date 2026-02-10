@@ -10,7 +10,7 @@ class LSTMModel(nn.Module):
 
     def __init__(self, input_size: int, hidden_size: int = 128,
                  num_layers: int = 2, dropout: float = 0.3,
-                 fc_hidden_size: int = 64, num_classes: int = 2):
+                 fc_hidden_size: int = 64, **kwargs):
         super().__init__()
         self.model_name = "lstm"
 
@@ -23,6 +23,9 @@ class LSTMModel(nn.Module):
         )
         self.lstm_bn = nn.BatchNorm1d(hidden_size)
         self.dropout = nn.Dropout(dropout)
+
+        # 残差: 将输入最后时步投影到hidden_size
+        self.residual_proj = nn.Linear(input_size, hidden_size)
 
         # 单输出用于BCE
         self.classifier = nn.Sequential(
@@ -56,5 +59,10 @@ class LSTMModel(nn.Module):
         last = lstm_out[:, -1, :]
         last = self.lstm_bn(last)
         last = self.dropout(last)
+
+        # 残差连接: 输入最后时步 -> hidden_size
+        residual = self.residual_proj(x[:, -1, :])
+        last = last + residual
+
         out = self.classifier(last)
         return out.squeeze(-1)
