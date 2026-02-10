@@ -316,7 +316,7 @@ class FeatureEngineer:
         gap_map = overnight_gap.to_dict()
         df['overnight_gap'] = _date.map(gap_map)
 
-        # 开盘30分钟动量: 开盘后6根K线的收益率
+        # 开盘30分钟动量: 用前一日的值 (当日值在开盘30min内不可知)
         def calc_open_momentum(group):
             if len(group) >= 6:
                 mom = group['close'].iloc[5] / group['open'].iloc[0] - 1
@@ -324,19 +324,30 @@ class FeatureEngineer:
                 mom = 0.0
             return pd.Series(mom, index=group.index)
 
-        df['open_30min_momentum'] = df.groupby(_date).apply(calc_open_momentum).reset_index(level=0, drop=True)
+        daily_momentum = df.groupby(_date).apply(calc_open_momentum).reset_index(level=0, drop=True)
+        # shift by 1 day: 每天用前一日的开盘动量
+        unique_dates = sorted(_date.unique())
+        date_to_prev_mom = {}
+        prev_mom = 0.0
+        for d in unique_dates:
+            date_to_prev_mom[d] = prev_mom
+            mask = _date == d
+            if mask.any():
+                prev_mom = daily_momentum[mask].iloc[0]
+        df['open_30min_momentum'] = _date.map(date_to_prev_mom)
 
-        # 日内累计收益 (从开盘算起)
+        # 日内累计收益 (从开盘算起) — 实时可知，无泄露
         daily_first_close = df.groupby(_date)['close'].transform('first')
         df['intraday_return'] = df['close'] / daily_first_close - 1
 
-        # 上午vs下午成交量比
+        # 上午vs下午成交量比 — 用前一日的值 (当日值要收盘才知道)
         df['_is_am'] = (df['datetime'].dt.hour < 12).astype(int)
-        am_vol = df.groupby([_date, '_is_am'])['volume'].transform('sum')
         pm_vol_map = df[df['_is_am'] == 0].groupby(df.loc[df['_is_am'] == 0, 'datetime'].dt.date)['volume'].sum()
         am_vol_map = df[df['_is_am'] == 1].groupby(df.loc[df['_is_am'] == 1, 'datetime'].dt.date)['volume'].sum()
-        ratio_map = (am_vol_map / (pm_vol_map.reindex(am_vol_map.index, fill_value=1) + 1e-10)).to_dict()
-        df['am_pm_vol_ratio'] = _date.map(ratio_map).fillna(1.0)
+        ratio_map = (am_vol_map / (pm_vol_map.reindex(am_vol_map.index, fill_value=1) + 1e-10))
+        # shift by 1 day
+        ratio_shifted = ratio_map.shift(1).to_dict()
+        df['am_pm_vol_ratio'] = _date.map(ratio_shifted).fillna(1.0)
         df.drop(columns=['_is_am'], inplace=True)
 
         return df
@@ -362,6 +373,8 @@ class FeatureEngineer:
             return df
 
         merge_df = idx_df[['date'] + idx_cols].copy()
+        # 用前一日的指数特征，避免日内前视偏差
+        merge_df[idx_cols] = merge_df[idx_cols].shift(1)
         merge_df = merge_df.rename(columns={'date': '_idx_date'})
         df['_merge_date'] = df['datetime'].dt.date
         df = df.merge(merge_df, left_on='_merge_date', right_on='_idx_date', how='left')
