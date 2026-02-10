@@ -36,7 +36,7 @@ def run_experiment(df_featured, fe, seq_len, model_types):
     fe_copy = FeatureEngineer()
     fe_copy.feature_names = fe.feature_names.copy()
     fe_copy.select_features(df_featured, max_features=MAX_FEATURES, train_end_idx=train_end)
-    X, y, ts = fe_copy.create_sequences(df_featured, train_end_idx=train_end)
+    X, y, ts = fe_copy.create_sequences(df_featured, seq_length=seq_len, train_end_idx=train_end)
 
     cfg.SEQUENCE_LENGTH = orig_seq
 
