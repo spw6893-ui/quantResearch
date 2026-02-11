@@ -90,10 +90,16 @@ def run_experiment(df, horizon, model_types, seq_length=60):
             else:
                 import torch
                 model.eval()
+                test_probs_list = []
+                batch_sz = 512
                 with torch.no_grad():
-                    test_probs = torch.sigmoid(
-                        model(torch.FloatTensor(X_test).to(trainer.device))
-                    ).cpu().numpy()
+                    for bi in range(0, len(X_test), batch_sz):
+                        batch = torch.FloatTensor(X_test[bi:bi+batch_sz]).to(trainer.device)
+                        probs = torch.sigmoid(model(batch)).cpu().numpy()
+                        test_probs_list.append(probs)
+                        del batch
+                        torch.cuda.empty_cache()
+                test_probs = np.concatenate(test_probs_list)
 
             test_auc = roc_auc_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.5
             test_acc = accuracy_score(y_test, (test_probs >= 0.5).astype(int))
