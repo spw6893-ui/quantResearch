@@ -522,6 +522,147 @@ def fetch_btc_daily(start="2016-01-01", end="2026-02-11"):
     return btc
 
 
+def fetch_binance_klines_extended(
+    symbol: str = "BTCUSDT",
+    interval: str = "1d",
+    start=None,
+    end=None,
+    days_back: Optional[int] = None,
+    limit: int = 1000,
+    sleep_s: float = 0.2,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """拉 Binance 原生 Klines（带 taker buy volume / trades 数等扩展字段）。
+
+    说明：
+      - 这是“日级 orderflow 近似”（来自 taker buy volume），不是 L2 orderbook。
+      - 相比逐笔 trades，拉取量极小（5 年日线约 1800 行），非常适合做日级微观特征。
+    """
+    import time as _time
+    import ccxt
+
+    end_dt = _ensure_datetime(end)
+    if end_dt is None:
+        end_dt = pd.Timestamp.utcnow().tz_localize(None)
+    start_dt = _ensure_datetime(start)
+    if start_dt is None:
+        if days_back is None:
+            raise ValueError("fetch_binance_klines_extended 需要提供 start 或 days_back")
+        start_dt = end_dt - pd.Timedelta(days=int(days_back))
+
+    if start_dt >= end_dt:
+        raise ValueError(f"start({start_dt}) 必须早于 end({end_dt})")
+
+    exchange = ccxt.binance({"enableRateLimit": True})
+
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    rows = []
+    cur_ms = start_ms
+    page = 0
+    if verbose:
+        print(f"[klines] binance {symbol} {interval}: {start_dt} ~ {end_dt} (limit={limit})")
+
+    while cur_ms < end_ms:
+        params = {"symbol": symbol, "interval": interval, "startTime": cur_ms, "limit": limit}
+        # endTime 只是上界提示；部分情况下交易所会忽略/调整，后续再过滤
+        params["endTime"] = end_ms
+
+        data = exchange.publicGetKlines(params)
+        if not data:
+            break
+
+        rows.extend(data)
+        last_open_ms = int(data[-1][0])
+        if last_open_ms <= cur_ms:
+            cur_ms += 1
+        else:
+            cur_ms = last_open_ms + 1
+
+        page += 1
+        if verbose and page % 5 == 0:
+            ts = pd.to_datetime(last_open_ms, unit="ms", utc=True)
+            print(f"[klines] pages={page}, rows={len(rows)}, up_to={ts}")
+        _time.sleep(sleep_s)
+
+        if len(data) < limit:
+            break
+
+    if not rows:
+        return pd.DataFrame()
+
+    cols = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_volume",
+        "n_trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "ignore",
+    ]
+    df = pd.DataFrame(rows, columns=cols)
+    df["open_time"] = df["open_time"].astype("int64")
+    df = df[(df["open_time"] >= start_ms) & (df["open_time"] <= end_ms)].copy()
+
+    for c in ["open", "high", "low", "close", "volume", "quote_volume", "taker_buy_base", "taker_buy_quote"]:
+        df[c] = df[c].astype(float)
+    df["n_trades"] = df["n_trades"].astype("int64")
+
+    df["datetime"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_localize(None)
+    df["amount"] = df["quote_volume"]
+    df = df[[
+        "datetime", "open", "high", "low", "close", "volume", "amount",
+        "quote_volume", "n_trades", "taker_buy_base", "taker_buy_quote",
+    ]]
+    df = df.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+    return df
+
+
+def build_daily_orderflow_features_from_klines(df: pd.DataFrame, eps: float = 1e-10) -> pd.DataFrame:
+    """把扩展 Klines 转成日级“orderflow/微观结构”特征（无需逐笔 trades）。"""
+    out = df.copy()
+    if "taker_buy_base" not in out.columns or "quote_volume" not in out.columns:
+        raise ValueError("缺少 taker_buy_base/quote_volume 字段，请用 fetch_binance_klines_extended 获取")
+
+    out["buy_volume"] = out["taker_buy_base"].astype(float)
+    out["sell_volume"] = (out["volume"].astype(float) - out["buy_volume"]).clip(lower=0.0)
+    out["signed_volume"] = out["buy_volume"] - out["sell_volume"]
+    out["ofi"] = out["signed_volume"] / (out["volume"].astype(float) + eps)
+
+    out["buy_amount"] = out["taker_buy_quote"].astype(float)
+    out["sell_amount"] = (out["quote_volume"].astype(float) - out["buy_amount"]).clip(lower=0.0)
+    out["signed_amount"] = out["buy_amount"] - out["sell_amount"]
+    out["dollar_imbalance"] = out["signed_amount"] / (out["quote_volume"].astype(float) + eps)
+
+    out["vwap_trades"] = out["quote_volume"].astype(float) / (out["volume"].astype(float) + eps)
+    out["avg_trade_size"] = out["volume"].astype(float) / (out["n_trades"].astype(float) + eps)
+    out["bar_duration_sec"] = 86400.0
+
+    return out
+
+
+def fetch_btc_daily_orderflow(days_back: int = 1825, save_name: str = "btc_daily_orderflow.pkl") -> pd.DataFrame:
+    """拉取 5 年（日线）taker buy 量等字段，并保存日级 orderflow 特征。"""
+    # 取到最近一个完整 UTC 日（避免当天未收盘造成口径混乱）
+    end_dt = pd.Timestamp.utcnow().floor("D").tz_localize(None)
+    start_dt = end_dt - pd.Timedelta(days=int(days_back))
+
+    kl = fetch_binance_klines_extended(symbol="BTCUSDT", interval="1d", start=start_dt, end=end_dt, verbose=True)
+    if len(kl) == 0:
+        return kl
+    feat = build_daily_orderflow_features_from_klines(kl)
+    save_path = os.path.join(DATA_DIR, save_name)
+    feat.to_pickle(save_path)
+    print(f"[orderflow] saved: {save_path}, {len(feat):,} rows, {feat['datetime'].iloc[0]} ~ {feat['datetime'].iloc[-1]}")
+    return feat
+
+
 def _fetch_binance_ohlcv(symbol, timeframe, days_back, save_name):
     """Generic paginated fetcher for Binance via ccxt."""
     import ccxt
@@ -728,6 +869,8 @@ if __name__ == "__main__":
     parser.add_argument('--fetch-trades', action='store_true', help='Fetch & cache trades via ccxt')
     parser.add_argument('--trades-days', type=int, default=7, help='Trades history window in days (default 7)')
     parser.add_argument('--build-micro', action='store_true', help='Build microstructure features and save as cached bars')
+    parser.add_argument('--fetch-daily-orderflow', action='store_true',
+                        help='Fetch 5y daily orderflow features (taker buy volume from Binance klines)')
     args = parser.parse_args()
     if args.force:
         fetch_btc(args.freq, args.days)
@@ -746,3 +889,6 @@ if __name__ == "__main__":
         out_path = os.path.join(DATA_DIR, f"btc_{args.freq}_micro.pkl")
         bars2.to_pickle(out_path)
         print(f"[micro] saved: {out_path} ({len(bars2):,} rows)")
+
+    if args.fetch_daily_orderflow:
+        fetch_btc_daily_orderflow(days_back=int(args.days))
