@@ -1,6 +1,6 @@
 """BTC ML Experiment: train LightGBM/XGBoost + Transformer-LSTM on BTC data.
 Reuses the existing model pipeline from the main project.
-Usage: python experiments/btc_ml_experiment.py [--freq daily|1h] [--horizons 1,7,14]
+Usage: python experiments/btc_ml_experiment.py [--freq daily|1h|30min|15min|5min] [--horizons 1,7,14]
 """
 import os, sys, time
 import numpy as np, pandas as pd
@@ -8,7 +8,7 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from experiments.btc_data import load_btc
+from experiments.btc_data import load_btc, ALL_FREQS
 from experiments.btc_signal_scan import add_ta_indicators
 from config.settings import LGBM_CONFIG, XGB_CONFIG, MAX_FEATURES, RANDOM_SEED
 from models.lgbm_model import LGBMModel
@@ -117,7 +117,7 @@ def run_experiment(df, horizon, model_types, seq_length=60):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="BTC ML Experiment")
-    parser.add_argument('--freq', default='daily', choices=['daily', '1h'])
+    parser.add_argument('--freq', default='daily', choices=ALL_FREQS)
     parser.add_argument('--horizons', default=None, help='Comma-separated horizons (e.g., 1,7,14)')
     parser.add_argument('--models', default='lgbm,xgboost,transformer_lstm',
                         help='Comma-separated model types')
@@ -131,6 +131,12 @@ def main():
         horizons = [int(x) for x in args.horizons.split(',')]
     elif args.freq == 'daily':
         horizons = [1, 3, 7, 14, 30]
+    elif args.freq == '5min':
+        horizons = [12, 48, 144, 288]  # 1h, 4h, 12h, 1d
+    elif args.freq == '15min':
+        horizons = [4, 16, 48, 96]  # 1h, 4h, 12h, 1d
+    elif args.freq == '30min':
+        horizons = [2, 8, 24, 48]  # 1h, 4h, 12h, 1d
     else:
         horizons = [1, 4, 12, 24, 48]
 

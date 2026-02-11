@@ -1,4 +1,4 @@
-"""BTC data fetcher: daily (yfinance, 10yr), hourly (ccxt, 5yr), 5min (ccxt, 5yr)"""
+"""BTC data fetcher: daily (yfinance, 10yr), 1h/30min/15min/5min (ccxt/Binance, 5yr)"""
 import os
 import sys
 import pandas as pd
@@ -7,6 +7,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "raw")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# Mapping from our freq names to Binance timeframes and filenames
+FREQ_MAP = {
+    '5min':  ('5m',  'btc_5min.pkl'),
+    '15min': ('15m', 'btc_15min.pkl'),
+    '30min': ('30m', 'btc_30min.pkl'),
+    '1h':    ('1h',  'btc_1h.pkl'),
+    'daily': (None,  'btc_daily.pkl'),
+}
+
+ALL_FREQS = list(FREQ_MAP.keys())
 
 
 def fetch_btc_daily(start="2016-01-01", end="2026-02-11"):
@@ -66,36 +77,35 @@ def _fetch_binance_ohlcv(symbol, timeframe, days_back, save_name):
     return df
 
 
-def fetch_btc_hourly(days_back=1825):
-    return _fetch_binance_ohlcv('BTC/USDT', '1h', days_back, 'btc_1h.pkl')
-
-
-def fetch_btc_5min(days_back=1825):
-    return _fetch_binance_ohlcv('BTC/USDT', '5m', days_back, 'btc_5min.pkl')
+def fetch_btc(freq, days_back=1825):
+    """Fetch BTC data for any supported frequency."""
+    if freq == 'daily':
+        return fetch_btc_daily()
+    timeframe, save_name = FREQ_MAP[freq]
+    return _fetch_binance_ohlcv('BTC/USDT', timeframe, days_back, save_name)
 
 
 def load_btc(freq="daily"):
-    fname = {"daily": "btc_daily.pkl", "1h": "btc_1h.pkl", "5min": "btc_5min.pkl"}[freq]
+    """Load cached BTC data, or fetch if not found."""
+    if freq not in FREQ_MAP:
+        raise ValueError(f"Unsupported freq: {freq}. Choose from {ALL_FREQS}")
+    _, fname = FREQ_MAP[freq]
     path = os.path.join(DATA_DIR, fname)
     if os.path.exists(path):
         df = pd.read_pickle(path)
         print(f"Loaded {path}: {len(df)} rows")
         return df
-    if freq == "daily":
-        return fetch_btc_daily()
-    elif freq == "1h":
-        return fetch_btc_hourly()
-    else:
-        return fetch_btc_5min()
+    return fetch_btc(freq)
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Fetch BTC OHLCV data")
-    parser.add_argument('--freq', default='daily', choices=['daily', '1h', '5min'])
+    parser.add_argument('--freq', default='daily', choices=ALL_FREQS)
     parser.add_argument('--force', action='store_true')
+    parser.add_argument('--days', type=int, default=1825, help='Days of history (default 1825=5yr)')
     args = parser.parse_args()
     if args.force:
-        {"daily": fetch_btc_daily, "1h": fetch_btc_hourly, "5min": fetch_btc_5min}[args.freq]()
+        fetch_btc(args.freq, args.days)
     else:
         load_btc(args.freq)

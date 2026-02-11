@@ -1,12 +1,12 @@
 """BTC TA Signal Mining: discrete win rates + continuous AUC scan across horizons.
-Usage: python experiments/btc_signal_scan.py [--freq daily|1h] [--fetch]
+Usage: python experiments/btc_signal_scan.py [--freq daily|1h|30min|15min|5min] [--fetch]
 """
 import os, sys
 import numpy as np, pandas as pd
 from sklearn.metrics import roc_auc_score
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from experiments.btc_data import load_btc, fetch_btc_daily, fetch_btc_hourly
+from experiments.btc_data import load_btc, fetch_btc, ALL_FREQS
 
 
 def add_ta_indicators(df):
@@ -239,15 +239,12 @@ def run_auc_scan(test, horizons):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="BTC TA Signal Mining")
-    parser.add_argument('--freq', default='daily', choices=['daily', '1h'])
+    parser.add_argument('--freq', default='daily', choices=ALL_FREQS)
     parser.add_argument('--fetch', action='store_true', help='Force re-download data')
     args = parser.parse_args()
 
     if args.fetch:
-        if args.freq == 'daily':
-            df = fetch_btc_daily()
-        else:
-            df = fetch_btc_hourly()
+        df = fetch_btc(args.freq)
     else:
         df = load_btc(args.freq)
 
@@ -256,11 +253,17 @@ def main():
     # Add indicators
     df = add_ta_indicators(df)
 
-    # Add labels
+    # Add labels - horizons depend on frequency
     if args.freq == 'daily':
         horizons = [1, 3, 5, 7, 14, 30]
-    else:
+    elif args.freq == '1h':
         horizons = [1, 4, 12, 24, 48, 168]  # 1h, 4h, 12h, 1d, 2d, 1w
+    elif args.freq == '30min':
+        horizons = [2, 8, 24, 48, 96, 336]  # 1h, 4h, 12h, 1d, 2d, 1w
+    elif args.freq == '15min':
+        horizons = [4, 16, 48, 96, 192, 672]  # 1h, 4h, 12h, 1d, 2d, 1w
+    elif args.freq == '5min':
+        horizons = [12, 48, 144, 288, 576, 2016]  # 1h, 4h, 12h, 1d, 2d, 1w
 
     for h in horizons:
         df[f'label_{h}'] = (df['close'].shift(-h) / df['close'] - 1 > 0).astype(int)
