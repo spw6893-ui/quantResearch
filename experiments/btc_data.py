@@ -1,4 +1,4 @@
-"""BTC data fetcher: daily (yfinance, 10yr), hourly (ccxt, ~2yr), 5min (ccxt, ~3mo)"""
+"""BTC data fetcher: daily (yfinance, 10yr), hourly (ccxt, 5yr), 5min (ccxt, 5yr)"""
 import os
 import sys
 import pandas as pd
@@ -25,54 +25,53 @@ def fetch_btc_daily(start="2016-01-01", end="2026-02-11"):
     return btc
 
 
-def fetch_btc_hourly(days_back=730):
+def _fetch_binance_ohlcv(symbol, timeframe, days_back, save_name):
+    """Generic paginated fetcher for Binance via ccxt."""
     import ccxt
+    import time as _time
     exchange = ccxt.binance()
     since = exchange.milliseconds() - days_back * 24 * 3600 * 1000
     all_data = []
-    print(f"Fetching BTC/USDT 1h from Binance, {days_back} days...")
+    batch = 0
+    print(f"Fetching {symbol} {timeframe} from Binance, {days_back} days (~{days_back/365:.1f}yr)...")
     while True:
-        ohlcv = exchange.fetch_ohlcv('BTC/USDT', '1h', since=since, limit=1000)
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+        except Exception as e:
+            print(f"  API error (retrying in 5s): {e}")
+            _time.sleep(5)
+            continue
         if not ohlcv:
             break
         all_data.extend(ohlcv)
         since = ohlcv[-1][0] + 1
+        batch += 1
+        if batch % 50 == 0:
+            ts = pd.to_datetime(ohlcv[-1][0], unit='ms')
+            print(f"  ... {len(all_data):,} candles fetched, up to {ts}")
         if len(ohlcv) < 1000:
             break
+        _time.sleep(0.1)  # rate limit
+    if not all_data:
+        print("  No data returned")
+        return pd.DataFrame()
     df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     df['amount'] = df['close'] * df['volume']
     df = df[['datetime', 'open', 'high', 'low', 'close', 'volume', 'amount']]
     df = df.drop_duplicates(subset=['datetime']).sort_values('datetime').reset_index(drop=True)
-    save_path = os.path.join(DATA_DIR, "btc_1h.pkl")
+    save_path = os.path.join(DATA_DIR, save_name)
     df.to_pickle(save_path)
-    print(f"BTC 1h saved: {save_path}, {len(df)} rows, {df['datetime'].iloc[0]} ~ {df['datetime'].iloc[-1]}")
+    print(f"Saved: {save_path}, {len(df):,} rows, {df['datetime'].iloc[0]} ~ {df['datetime'].iloc[-1]}")
     return df
 
 
-def fetch_btc_5min(days_back=90):
-    import ccxt
-    exchange = ccxt.binance()
-    since = exchange.milliseconds() - days_back * 24 * 3600 * 1000
-    all_data = []
-    print(f"Fetching BTC/USDT 5m from Binance, {days_back} days...")
-    while True:
-        ohlcv = exchange.fetch_ohlcv('BTC/USDT', '5m', since=since, limit=1000)
-        if not ohlcv:
-            break
-        all_data.extend(ohlcv)
-        since = ohlcv[-1][0] + 1
-        if len(ohlcv) < 1000:
-            break
-    df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df['amount'] = df['close'] * df['volume']
-    df = df[['datetime', 'open', 'high', 'low', 'close', 'volume', 'amount']]
-    df = df.drop_duplicates(subset=['datetime']).sort_values('datetime').reset_index(drop=True)
-    save_path = os.path.join(DATA_DIR, "btc_5min.pkl")
-    df.to_pickle(save_path)
-    print(f"BTC 5min saved: {save_path}, {len(df)} rows, {df['datetime'].iloc[0]} ~ {df['datetime'].iloc[-1]}")
-    return df
+def fetch_btc_hourly(days_back=1825):
+    return _fetch_binance_ohlcv('BTC/USDT', '1h', days_back, 'btc_1h.pkl')
+
+
+def fetch_btc_5min(days_back=1825):
+    return _fetch_binance_ohlcv('BTC/USDT', '5m', days_back, 'btc_5min.pkl')
 
 
 def load_btc(freq="daily"):
