@@ -8,7 +8,7 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from experiments.btc_data import load_btc, ALL_FREQS
+from experiments.btc_data import load_btc, ALL_FREQS, triple_barrier_label
 from experiments.btc_signal_scan import add_ta_indicators
 from config.settings import LGBM_CONFIG, XGB_CONFIG, MAX_FEATURES, RANDOM_SEED
 from models.lgbm_model import LGBMModel
@@ -19,10 +19,16 @@ from utils.helpers import set_seed
 set_seed(RANDOM_SEED)
 
 
-def build_features(df, horizon):
+def build_features(df, horizon, label_mode='binary', pt_sl=(1.0, 1.0)):
     """Build features and labels for a given horizon."""
     df = add_ta_indicators(df.copy())
-    df['label'] = (df['close'].shift(-horizon) / df['close'] - 1 > 0).astype(int)
+    if label_mode == 'triple_barrier':
+        tb = triple_barrier_label(df, horizon, pt_sl=pt_sl)
+        # Map to binary: +1 -> 1 (up), else -> 0
+        df['label'] = (tb == 1).astype(int)
+        df['tb_raw'] = tb
+    else:
+        df['label'] = (df['close'].shift(-horizon) / df['close'] - 1 > 0).astype(int)
     df['future_return'] = df['close'].shift(-horizon) / df['close'] - 1
 
     exclude = {'datetime', 'open', 'high', 'low', 'close', 'volume', 'amount',
@@ -53,9 +59,9 @@ def create_sequences(df, feature_cols, seq_length=60):
     return np.array(X, dtype=np.float32), np.array(y)
 
 
-def run_experiment(df, horizon, model_types, seq_length=60):
+def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary', pt_sl=(1.0, 1.0)):
     """Run single horizon experiment with multiple models."""
-    df_feat, feature_cols = build_features(df, horizon)
+    df_feat, feature_cols = build_features(df, horizon, label_mode, pt_sl)
     if len(df_feat) < 500:
         print(f"  Insufficient data ({len(df_feat)} rows), skipping")
         return None
@@ -128,6 +134,10 @@ def main():
     parser.add_argument('--models', default='lgbm,xgboost,transformer_lstm',
                         help='Comma-separated model types')
     parser.add_argument('--seq-length', type=int, default=60)
+    parser.add_argument('--label-mode', default='binary', choices=['binary', 'triple_barrier'],
+                        help='Labeling method: binary or triple_barrier (AFML)')
+    parser.add_argument('--pt-sl', default='1.0,1.0',
+                        help='Profit-take,stop-loss multipliers for triple barrier')
     args = parser.parse_args()
 
     df = load_btc(args.freq)
@@ -143,6 +153,8 @@ def main():
         horizons = [4, 16, 48, 96]  # 1h, 4h, 12h, 1d
     elif args.freq == '30min':
         horizons = [2, 8, 24, 48]  # 1h, 4h, 12h, 1d
+    elif args.freq.startswith('vbar'):
+        horizons = [1, 5, 10, 20, 50, 100]  # volume bars
     else:
         horizons = [1, 4, 12, 24, 48]
 
@@ -152,12 +164,16 @@ def main():
     print(f'Models: {model_types}')
     print(f'Seq length: {args.seq_length}')
 
+    pt_sl_vals = tuple(float(x) for x in args.pt_sl.split(','))
+    if args.label_mode == 'triple_barrier':
+        print(f'Label mode: Triple Barrier (pt={pt_sl_vals[0]}, sl={pt_sl_vals[1]})')
+
     all_results = []
     for h in horizons:
         print(f'\n{"="*70}')
         print(f'  Horizon: {h} bars')
         print(f'{"="*70}')
-        result = run_experiment(df, h, model_types, args.seq_length)
+        result = run_experiment(df, h, model_types, args.seq_length, args.label_mode, pt_sl_vals)
         if result:
             all_results.append(result)
 

@@ -136,6 +136,56 @@ def make_volume_bars(df, vol_threshold):
     return result
 
 
+
+
+def triple_barrier_label(df, max_horizon, pt_sl=(1.0, 1.0), vol_lookback=20):
+    """Triple Barrier Method (Lopez de Prado, AFML Ch.3).
+
+    For each bar, set three barriers:
+      - Upper (profit-take): entry + pt_mult * daily_vol
+      - Lower (stop-loss):   entry - sl_mult * daily_vol
+      - Vertical:            max_horizon bars ahead
+
+    Label: +1 if upper hit first, -1 if lower hit first, 0 if vertical expires.
+
+    Args:
+        df: DataFrame with close column.
+        max_horizon: vertical barrier in bar counts.
+        pt_sl: (profit_take_mult, stop_loss_mult) relative to rolling volatility.
+        vol_lookback: lookback for volatility estimate.
+
+    Returns:
+        pd.Series of labels {-1, 0, 1}, same index as df.
+    """
+    close = df["close"].values
+    # Rolling volatility (std of log returns)
+    log_ret = np.log(df["close"] / df["close"].shift(1))
+    vol = log_ret.rolling(vol_lookback).std().values
+
+    pt_mult, sl_mult = pt_sl
+    n = len(close)
+    labels = np.full(n, np.nan)
+
+    for i in range(vol_lookback, n):
+        if np.isnan(vol[i]) or vol[i] < 1e-10:
+            continue
+        entry = close[i]
+        upper = entry * (1 + pt_mult * vol[i])
+        lower = entry * (1 - sl_mult * vol[i])
+        end = min(i + max_horizon, n - 1)
+
+        label = 0  # default: vertical barrier (no touch)
+        for j in range(i + 1, end + 1):
+            if close[j] >= upper:
+                label = 1
+                break
+            if close[j] <= lower:
+                label = -1
+                break
+        labels[i] = label
+
+    return pd.Series(labels, index=df.index)
+
 def build_volume_bars(freq, source_freq='5min'):
     """Build volume bars from raw time-bar data.
 

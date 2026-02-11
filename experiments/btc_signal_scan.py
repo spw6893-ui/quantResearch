@@ -6,7 +6,7 @@ import numpy as np, pandas as pd
 from sklearn.metrics import roc_auc_score
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from experiments.btc_data import load_btc, fetch_btc, ALL_FREQS
+from experiments.btc_data import load_btc, fetch_btc, ALL_FREQS, triple_barrier_label
 
 
 def add_ta_indicators(df):
@@ -241,6 +241,10 @@ def main():
     parser = argparse.ArgumentParser(description="BTC TA Signal Mining")
     parser.add_argument('--freq', default='daily', choices=ALL_FREQS)
     parser.add_argument('--fetch', action='store_true', help='Force re-download data')
+    parser.add_argument('--label-mode', default='binary', choices=['binary', 'triple_barrier'],
+                        help='Labeling method: binary (next bar up/down) or triple_barrier (AFML)')
+    parser.add_argument('--pt-sl', default='1.0,1.0',
+                        help='Profit-take,stop-loss multipliers for triple barrier (e.g. 1.0,1.0)')
     args = parser.parse_args()
 
     if args.fetch:
@@ -264,9 +268,23 @@ def main():
         horizons = [4, 16, 48, 96, 192, 672]  # 1h, 4h, 12h, 1d, 2d, 1w
     elif args.freq == '5min':
         horizons = [12, 48, 144, 288, 576, 2016]  # 1h, 4h, 12h, 1d, 2d, 1w
+    else:
+        horizons = [1, 5, 10, 20, 50, 100]  # volume bars
 
-    for h in horizons:
-        df[f'label_{h}'] = (df['close'].shift(-h) / df['close'] - 1 > 0).astype(int)
+    if args.label_mode == 'triple_barrier':
+        pt_sl_vals = tuple(float(x) for x in args.pt_sl.split(','))
+        print(f'Label mode: Triple Barrier (pt={pt_sl_vals[0]}, sl={pt_sl_vals[1]})')
+        for h in horizons:
+            tb = triple_barrier_label(df, h, pt_sl=pt_sl_vals)
+            # For discrete scan: 1=up, 0=down (map -1->0 for compatibility)
+            df[f'label_{h}'] = (tb == 1).astype(int)
+            # Keep raw triple barrier label for analysis
+            df[f'tb_raw_{h}'] = tb
+            dist = tb.value_counts().to_dict()
+            print(f'  h={h}: +1={dist.get(1.0,0)}, 0={dist.get(0.0,0)}, -1={dist.get(-1.0,0)}')
+    else:
+        for h in horizons:
+            df[f'label_{h}'] = (df['close'].shift(-h) / df['close'] - 1 > 0).astype(int)
 
     df = df.dropna().reset_index(drop=True)
     split = int(len(df) * 0.7)
