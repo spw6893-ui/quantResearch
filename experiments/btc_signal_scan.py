@@ -6,7 +6,15 @@ import numpy as np, pandas as pd
 from sklearn.metrics import roc_auc_score
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from experiments.btc_data import load_btc, fetch_btc, ALL_FREQS, triple_barrier_label
+from experiments.btc_data import (
+    load_btc,
+    fetch_btc,
+    ALL_FREQS,
+    triple_barrier_label,
+    fetch_trades_ccxt,
+    aggregate_trades_to_bars,
+    add_microstructure_features,
+)
 
 
 def add_ta_indicators(df):
@@ -245,6 +253,12 @@ def main():
                         help='Labeling method: binary (next bar up/down) or triple_barrier (AFML)')
     parser.add_argument('--pt-sl', default='1.0,1.0',
                         help='Profit-take,stop-loss multipliers for triple barrier (e.g. 1.0,1.0)')
+    parser.add_argument('--micro', action='store_true',
+                        help='Add microstructure features from ccxt trades (best effort)')
+    parser.add_argument('--trades-days', type=int, default=30,
+                        help='Trades lookback days ending at last bar time (default 30)')
+    parser.add_argument('--vpin-window', type=int, default=50)
+    parser.add_argument('--kyle-window', type=int, default=50)
     args = parser.parse_args()
 
     if args.fetch:
@@ -253,6 +267,13 @@ def main():
         df = load_btc(args.freq)
 
     print(f'\nData: {len(df)} bars, {df["datetime"].iloc[0]} ~ {df["datetime"].iloc[-1]}')
+
+    if args.micro:
+        end_dt = pd.to_datetime(df["datetime"].iloc[-1])
+        start_dt = end_dt - pd.Timedelta(days=int(args.trades_days))
+        trades = fetch_trades_ccxt(start=start_dt, end=end_dt, verbose=True)
+        df = aggregate_trades_to_bars(df, trades)
+        df = add_microstructure_features(df, vpin_window=int(args.vpin_window), kyle_window=int(args.kyle_window))
 
     # Add indicators
     df = add_ta_indicators(df)

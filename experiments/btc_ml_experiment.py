@@ -8,7 +8,14 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from experiments.btc_data import load_btc, ALL_FREQS, triple_barrier_label
+from experiments.btc_data import (
+    load_btc,
+    ALL_FREQS,
+    triple_barrier_label,
+    fetch_trades_ccxt,
+    aggregate_trades_to_bars,
+    add_microstructure_features,
+)
 from experiments.btc_signal_scan import add_ta_indicators
 from config.settings import LGBM_CONFIG, XGB_CONFIG, MAX_FEATURES, RANDOM_SEED
 from models.lgbm_model import LGBMModel
@@ -32,7 +39,7 @@ def build_features(df, horizon, label_mode='binary', pt_sl=(1.0, 1.0)):
     df['future_return'] = df['close'].shift(-horizon) / df['close'] - 1
 
     exclude = {'datetime', 'open', 'high', 'low', 'close', 'volume', 'amount',
-               'label', 'future_return'}
+               'label', 'future_return', 'tb_raw'}
     feature_cols = [c for c in df.columns if c not in exclude and df[c].dtype in ('float64', 'float32', 'int64', 'int32')]
     df = df.dropna(subset=feature_cols + ['label']).reset_index(drop=True)
     return df, feature_cols
@@ -131,17 +138,31 @@ def main():
     parser = argparse.ArgumentParser(description="BTC ML Experiment")
     parser.add_argument('--freq', default='daily', choices=ALL_FREQS)
     parser.add_argument('--horizons', default=None, help='Comma-separated horizons (e.g., 1,7,14)')
-    parser.add_argument('--models', default='lgbm,xgboost,transformer_lstm',
+    parser.add_argument('--models', default='lgbm,xgboost',
                         help='Comma-separated model types')
     parser.add_argument('--seq-length', type=int, default=60)
     parser.add_argument('--label-mode', default='binary', choices=['binary', 'triple_barrier'],
                         help='Labeling method: binary or triple_barrier (AFML)')
     parser.add_argument('--pt-sl', default='1.0,1.0',
                         help='Profit-take,stop-loss multipliers for triple barrier')
+    parser.add_argument('--micro', action='store_true',
+                        help='Add microstructure features from ccxt trades (best effort)')
+    parser.add_argument('--trades-days', type=int, default=30,
+                        help='Trades lookback days ending at last bar time (default 30)')
+    parser.add_argument('--vpin-window', type=int, default=50)
+    parser.add_argument('--kyle-window', type=int, default=50)
     args = parser.parse_args()
 
     df = load_btc(args.freq)
     print(f'Data: {len(df)} bars, {df["datetime"].iloc[0]} ~ {df["datetime"].iloc[-1]}')
+
+    if args.micro:
+        end_dt = pd.to_datetime(df["datetime"].iloc[-1])
+        start_dt = end_dt - pd.Timedelta(days=int(args.trades_days))
+        trades = fetch_trades_ccxt(start=start_dt, end=end_dt, verbose=True)
+        df = aggregate_trades_to_bars(df, trades)
+        df = add_microstructure_features(df, vpin_window=int(args.vpin_window), kyle_window=int(args.kyle_window))
+        print(f"Microstructure columns added. Example: ofi/vpin/kyle -> {[c for c in ['ofi', f'vpin_{args.vpin_window}', f'kyle_lambda_{args.kyle_window}'] if c in df.columns]}")
 
     if args.horizons:
         horizons = [int(x) for x in args.horizons.split(',')]
