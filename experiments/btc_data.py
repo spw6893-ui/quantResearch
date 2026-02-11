@@ -1,6 +1,9 @@
-"""BTC data fetcher: daily (yfinance, 10yr), 1h/30min/15min/5min (ccxt/Binance, 5yr)"""
+"""BTC data fetcher: daily (yfinance, 10yr), 1h/30min/15min/5min (ccxt/Binance, 5yr)
+Also supports Volume Bars: resample raw time bars into volume-based bars.
+"""
 import os
 import sys
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,7 +20,14 @@ FREQ_MAP = {
     'daily': (None,  'btc_daily.pkl'),
 }
 
-ALL_FREQS = list(FREQ_MAP.keys())
+# Volume bar configs: threshold in BTC volume per bar
+VOLUME_BAR_CONFIGS = {
+    'vbar_100':  100,    # ~100 BTC per bar
+    'vbar_500':  500,    # ~500 BTC per bar
+    'vbar_1000': 1000,   # ~1000 BTC per bar
+}
+
+ALL_FREQS = list(FREQ_MAP.keys()) + list(VOLUME_BAR_CONFIGS.keys())
 
 
 def fetch_btc_daily(start="2016-01-01", end="2026-02-11"):
@@ -77,8 +87,85 @@ def _fetch_binance_ohlcv(symbol, timeframe, days_back, save_name):
     return df
 
 
+def make_volume_bars(df, vol_threshold):
+    """Convert time-based OHLCV into volume bars.
+
+    Each bar accumulates volume until vol_threshold is reached, then closes.
+    Returns a new DataFrame with the same OHLCV+amount columns.
+    """
+    datetimes = df['datetime'].values
+    opens = df['open'].values
+    highs = df['high'].values
+    lows = df['low'].values
+    closes = df['close'].values
+    volumes = df['volume'].values
+    amounts = df['amount'].values
+
+    bars = []
+    cum_vol = 0.0
+    cum_amount = 0.0
+    bar_open = 0.0
+    bar_high = -1e18
+    bar_low = 1e18
+    bar_start_dt = None
+
+    for i in range(len(df)):
+        if bar_start_dt is None:
+            bar_open = opens[i]
+            bar_start_dt = datetimes[i]
+            bar_high = highs[i]
+            bar_low = lows[i]
+
+        if highs[i] > bar_high:
+            bar_high = highs[i]
+        if lows[i] < bar_low:
+            bar_low = lows[i]
+        cum_vol += volumes[i]
+        cum_amount += amounts[i]
+
+        if cum_vol >= vol_threshold:
+            bars.append((
+                bar_start_dt, bar_open, bar_high, bar_low,
+                closes[i], cum_vol, cum_amount,
+            ))
+            cum_vol = 0.0
+            cum_amount = 0.0
+            bar_start_dt = None
+
+    result = pd.DataFrame(bars, columns=['datetime', 'open', 'high', 'low', 'close', 'volume', 'amount'])
+    return result
+
+
+def build_volume_bars(freq, source_freq='5min'):
+    """Build volume bars from raw time-bar data.
+
+    Args:
+        freq: one of 'vbar_100', 'vbar_500', 'vbar_1000'
+        source_freq: base time bars to aggregate from (default '5min')
+    """
+    vol_threshold = VOLUME_BAR_CONFIGS[freq]
+    print(f"Building volume bars: {freq} (threshold={vol_threshold} BTC) from {source_freq} data...")
+
+    # Load source data
+    source_df = load_btc(source_freq)
+    vbars = make_volume_bars(source_df, vol_threshold)
+
+    save_path = os.path.join(DATA_DIR, f"btc_{freq}.pkl")
+    vbars.to_pickle(save_path)
+    print(f"Volume bars saved: {save_path}, {len(vbars):,} bars")
+    if len(vbars) > 0:
+        total_time = (pd.Timestamp(vbars['datetime'].iloc[-1]) - pd.Timestamp(vbars['datetime'].iloc[0]))
+        avg_duration = total_time / len(vbars)
+        print(f"  Time range: {vbars['datetime'].iloc[0]} ~ {vbars['datetime'].iloc[-1]}")
+        print(f"  Avg bar duration: {avg_duration}")
+        print(f"  Avg volume/bar: {vbars['volume'].mean():.1f} BTC")
+    return vbars
+
+
 def fetch_btc(freq, days_back=1825):
     """Fetch BTC data for any supported frequency."""
+    if freq in VOLUME_BAR_CONFIGS:
+        return build_volume_bars(freq)
     if freq == 'daily':
         return fetch_btc_daily()
     timeframe, save_name = FREQ_MAP[freq]
@@ -87,6 +174,14 @@ def fetch_btc(freq, days_back=1825):
 
 def load_btc(freq="daily"):
     """Load cached BTC data, or fetch if not found."""
+    if freq in VOLUME_BAR_CONFIGS:
+        path = os.path.join(DATA_DIR, f"btc_{freq}.pkl")
+        if os.path.exists(path):
+            df = pd.read_pickle(path)
+            print(f"Loaded {path}: {len(df)} rows")
+            return df
+        return build_volume_bars(freq)
+
     if freq not in FREQ_MAP:
         raise ValueError(f"Unsupported freq: {freq}. Choose from {ALL_FREQS}")
     _, fname = FREQ_MAP[freq]
