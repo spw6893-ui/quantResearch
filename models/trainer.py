@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import (
     TRAINING_CONFIG, CV_CONFIG, OPTUNA_CONFIG, MODEL_DIR,
     TRANSFORMER_LSTM_CONFIG, LSTM_CONFIG, CNN_CONFIG, MLP_CONFIG, LGBM_CONFIG, XGB_CONFIG,
-    SEQUENCE_LENGTH, DEVICE, RANDOM_SEED
+    TFT_CONFIG, SEQUENCE_LENGTH, DEVICE, RANDOM_SEED
 )
 from models.transformer_lstm import TransformerLSTM
 from models.lstm_model import LSTMModel
@@ -26,6 +26,7 @@ from models.cnn_model import CNNModel
 from models.mlp_model import MLPModel
 from models.lgbm_model import LGBMModel
 from models.xgb_model import XGBModel
+from models.tft_model import TemporalFusionTransformer
 from utils.logger import get_logger
 from utils.helpers import set_seed, ensure_dir
 
@@ -155,6 +156,17 @@ class ModelTrainer:
                 seq_length=seq_length,
                 hidden_sizes=config['hidden_sizes'],
                 dropout=config['dropout'],
+            )
+        elif model_type == "tft":
+            config = {**TFT_CONFIG, **kwargs}
+            model = TemporalFusionTransformer(
+                input_size=input_size,
+                d_model=config['d_model'],
+                nhead=config['nhead'],
+                lstm_hidden_size=config['lstm_hidden_size'],
+                lstm_num_layers=config['lstm_num_layers'],
+                dropout=config['dropout'],
+                fc_hidden_size=config['fc_hidden_size'],
             )
         elif model_type == "lgbm":
             config = {**LGBM_CONFIG, **kwargs}

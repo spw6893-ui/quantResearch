@@ -97,6 +97,17 @@ MLP_CONFIG = {
     "hidden_sizes": [256, 128, 64],
     "dropout": 0.3,
 }
+# TFT (Temporal Fusion Transformer)
+TFT_CONFIG = {
+    "d_model": 64,
+    "nhead": 4,
+    "lstm_hidden_size": 128,
+    "lstm_num_layers": 2,
+    "dropout": 0.3,
+    "fc_hidden_size": 64,
+}
+
+
 
 # LightGBM模型 (强正则化防过拟合)
 LGBM_CONFIG = {
