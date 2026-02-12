@@ -69,14 +69,34 @@ def _print_kv(title: str, kv: dict):
         print(f"  - {k}: {v}")
 
 
-def _build_labels(df: pd.DataFrame, horizon: int, label_mode: str, pt_sl: tuple[float, float]):
+def _build_labels(
+    df: pd.DataFrame,
+    horizon: int,
+    label_mode: str,
+    pt_sl: tuple[float, float],
+    tb_zero_mode: str,
+):
+    """构造标签。
+
+    关键点：若使用 triple barrier，tb_raw==0 表示“到期未触碰上下轨”。
+    如果你要“按涨跌来”，更合理的做法是：tb_raw==0 时用到期收益的正负来决定 0/1（tb_zero_mode=sign）。
+    """
+    df["future_return"] = df["close"].shift(-horizon) / df["close"] - 1
     if label_mode == "triple_barrier":
         tb = triple_barrier_label(df, horizon, pt_sl=pt_sl)
         df["tb_raw"] = tb
-        df["label"] = (tb == 1).astype(int)
+        if tb_zero_mode == "as_negative":
+            df["label"] = (tb == 1).astype(int)
+        elif tb_zero_mode == "sign":
+            # -1 -> 0, +1 -> 1, 0 -> 按到期收益涨跌
+            base = (tb == 1).astype(int)
+            zero_mask = (tb == 0)
+            base.loc[zero_mask] = (df.loc[zero_mask, "future_return"] > 0).astype(int)
+            df["label"] = base.astype(int)
+        else:
+            raise ValueError(f"未知 tb_zero_mode: {tb_zero_mode}")
     else:
-        df["label"] = (df["close"].shift(-horizon) / df["close"] - 1 > 0).astype(int)
-    df["future_return"] = df["close"].shift(-horizon) / df["close"] - 1
+        df["label"] = (df["future_return"] > 0).astype(int)
     return df
 
 
@@ -147,6 +167,8 @@ def main():
     parser.add_argument("--horizon", type=int, default=None, help="预测跨度（bar 数）；不填则按 freq 取默认")
     parser.add_argument("--label-mode", default="triple_barrier", choices=["binary", "triple_barrier"])
     parser.add_argument("--pt-sl", default="1.0,1.0", help="triple barrier 的 pt,sl 倍数（相对波动）")
+    parser.add_argument("--tb-zero-mode", default="sign", choices=["sign", "as_negative"],
+                        help="triple barrier 下 tb_raw==0 的处理：sign=按到期涨跌；as_negative=当作负类")
 
     parser.add_argument("--vpin-window", type=int, default=50)
     parser.add_argument("--kyle-window", type=int, default=50)
@@ -189,6 +211,7 @@ def main():
         "horizon": args.horizon,
         "label_mode": args.label_mode,
         "pt_sl": pt_sl,
+        "tb_zero_mode": args.tb_zero_mode,
         "vpin_window": args.vpin_window,
         "kyle_window": args.kyle_window,
         "train": {
@@ -240,7 +263,7 @@ def main():
         kyle_window=int(args.kyle_window),
     )
     df = _add_basic_price_features(df)
-    df = _build_labels(df, int(args.horizon), args.label_mode, pt_sl)
+    df = _build_labels(df, int(args.horizon), args.label_mode, pt_sl, args.tb_zero_mode)
 
     # 特征列：所有数值列，排除标签/未来信息/时间
     exclude = {"datetime", "label", "future_return", "tb_raw"}
