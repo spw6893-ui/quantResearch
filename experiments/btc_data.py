@@ -625,10 +625,27 @@ def fetch_binance_klines_extended(
 
 
 def build_daily_orderflow_features_from_klines(df: pd.DataFrame, eps: float = 1e-10) -> pd.DataFrame:
-    """把扩展 Klines 转成日级“orderflow/微观结构”特征（无需逐笔 trades）。"""
+    """兼容旧名称：等同于 build_orderflow_features_from_klines(keep_raw_fields=True)。"""
+    return build_orderflow_features_from_klines(df, keep_raw_fields=True, eps=eps)
+
+
+def build_orderflow_features_from_klines(
+    df: pd.DataFrame,
+    keep_raw_fields: bool = True,
+    eps: float = 1e-10,
+) -> pd.DataFrame:
+    """把扩展 Klines 转成（日/小时/分钟）级别的 orderflow/微观结构特征（无需逐笔 trades）。
+
+    这些字段来自 Binance Klines 的扩展列：
+      - n_trades
+      - taker_buy_base / taker_buy_quote
+      - quote_volume（这里也会映射到 amount）
+    """
     out = df.copy()
-    if "taker_buy_base" not in out.columns or "quote_volume" not in out.columns:
-        raise ValueError("缺少 taker_buy_base/quote_volume 字段，请用 fetch_binance_klines_extended 获取")
+    need = {"taker_buy_base", "taker_buy_quote", "quote_volume", "n_trades", "volume"}
+    miss = [c for c in need if c not in out.columns]
+    if miss:
+        raise ValueError(f"缺少字段 {miss}，请用 fetch_binance_klines_extended 获取")
 
     out["buy_volume"] = out["taker_buy_base"].astype(float)
     out["sell_volume"] = (out["volume"].astype(float) - out["buy_volume"]).clip(lower=0.0)
@@ -640,9 +657,19 @@ def build_daily_orderflow_features_from_klines(df: pd.DataFrame, eps: float = 1e
     out["signed_amount"] = out["buy_amount"] - out["sell_amount"]
     out["dollar_imbalance"] = out["signed_amount"] / (out["quote_volume"].astype(float) + eps)
 
+    # 成交 VWAP（基于 quote/base），和 OHLC 的 close 不一定一致
     out["vwap_trades"] = out["quote_volume"].astype(float) / (out["volume"].astype(float) + eps)
     out["avg_trade_size"] = out["volume"].astype(float) / (out["n_trades"].astype(float) + eps)
-    out["bar_duration_sec"] = 86400.0
+
+    if not keep_raw_fields:
+        keep = [
+            "datetime", "open", "high", "low", "close", "volume", "amount",
+            "n_trades",
+            "buy_volume", "sell_volume", "ofi",
+            "buy_amount", "sell_amount", "dollar_imbalance",
+            "vwap_trades", "avg_trade_size",
+        ]
+        out = out[[c for c in keep if c in out.columns]].copy()
 
     return out
 
@@ -656,7 +683,7 @@ def fetch_btc_daily_orderflow(days_back: int = 1825, save_name: str = "btc_daily
     kl = fetch_binance_klines_extended(symbol="BTCUSDT", interval="1d", start=start_dt, end=end_dt, verbose=True)
     if len(kl) == 0:
         return kl
-    feat = build_daily_orderflow_features_from_klines(kl)
+    feat = build_orderflow_features_from_klines(kl, keep_raw_fields=True)
     save_path = os.path.join(DATA_DIR, save_name)
     feat.to_pickle(save_path)
     print(f"[orderflow] saved: {save_path}, {len(feat):,} rows, {feat['datetime'].iloc[0]} ~ {feat['datetime'].iloc[-1]}")
@@ -674,9 +701,50 @@ def fetch_btc_1h_orderflow(days_back: int = 1825, save_name: str = "btc_1h_order
     kl = fetch_binance_klines_extended(symbol="BTCUSDT", interval="1h", start=start_dt, end=end_dt, verbose=True)
     if len(kl) == 0:
         return kl
-    feat = build_daily_orderflow_features_from_klines(kl)
+    feat = build_orderflow_features_from_klines(kl, keep_raw_fields=True)
     save_path = os.path.join(DATA_DIR, save_name)
     feat.to_pickle(save_path)
+    print(f"[orderflow] saved: {save_path}, {len(feat):,} rows, {feat['datetime'].iloc[0]} ~ {feat['datetime'].iloc[-1]}")
+    return feat
+
+
+def fetch_btc_5min_orderflow(
+    days_back: int = 1825,
+    save_name: str = "btc_5min_orderflow.parquet",
+    sleep_s: float = 0.15,
+) -> pd.DataFrame:
+    """拉取 5 年（5分钟线）taker buy 量等字段，并保存 5min 级 orderflow 特征。
+
+    数据量：约 1825*24*12 ≈ 52.6 万行，适合用 parquet 保存（避免单文件过大导致 push 失败）。
+    """
+    end_dt = pd.Timestamp.utcnow().floor("5min").tz_localize(None)
+    start_dt = end_dt - pd.Timedelta(days=int(days_back))
+
+    kl = fetch_binance_klines_extended(
+        symbol="BTCUSDT",
+        interval="5m",
+        start=start_dt,
+        end=end_dt,
+        sleep_s=sleep_s,
+        verbose=True,
+    )
+    if len(kl) == 0:
+        return kl
+    feat = build_orderflow_features_from_klines(kl, keep_raw_fields=False)
+    feat["bar_duration_sec"] = 300.0
+
+    # 尽量压小体积，便于存储/推送
+    for c in feat.columns:
+        if c in ("datetime",):
+            continue
+        if c == "n_trades":
+            feat[c] = feat[c].astype("int32")
+        else:
+            if pd.api.types.is_float_dtype(feat[c]) or pd.api.types.is_integer_dtype(feat[c]):
+                feat[c] = feat[c].astype("float32")
+
+    save_path = os.path.join(DATA_DIR, save_name)
+    feat.to_parquet(save_path, index=False, compression="zstd")
     print(f"[orderflow] saved: {save_path}, {len(feat):,} rows, {feat['datetime'].iloc[0]} ~ {feat['datetime'].iloc[-1]}")
     return feat
 
@@ -891,6 +959,8 @@ if __name__ == "__main__":
                         help='Fetch 5y daily orderflow features (taker buy volume from Binance klines)')
     parser.add_argument('--fetch-1h-orderflow', action='store_true',
                         help='Fetch 5y 1h orderflow features (taker buy volume from Binance klines)')
+    parser.add_argument('--fetch-5min-orderflow', action='store_true',
+                        help='Fetch 5y 5min orderflow features (taker buy volume from Binance klines)')
     args = parser.parse_args()
     if args.force:
         fetch_btc(args.freq, args.days)
@@ -915,3 +985,6 @@ if __name__ == "__main__":
 
     if args.fetch_1h_orderflow:
         fetch_btc_1h_orderflow(days_back=int(args.days))
+
+    if args.fetch_5min_orderflow:
+        fetch_btc_5min_orderflow(days_back=int(args.days))
