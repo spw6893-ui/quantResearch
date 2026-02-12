@@ -663,6 +663,24 @@ def fetch_btc_daily_orderflow(days_back: int = 1825, save_name: str = "btc_daily
     return feat
 
 
+def fetch_btc_1h_orderflow(days_back: int = 1825, save_name: str = "btc_1h_orderflow.pkl") -> pd.DataFrame:
+    """拉取 5 年（小时线）taker buy 量等字段，并保存小时级 orderflow 特征。
+
+    说明：5 年小时线大约 1825*24 ≈ 4.4 万行，按 1000/页大约 44 页，实际拉取通常在 1 分钟级别。
+    """
+    end_dt = pd.Timestamp.utcnow().floor("h").tz_localize(None)
+    start_dt = end_dt - pd.Timedelta(days=int(days_back))
+
+    kl = fetch_binance_klines_extended(symbol="BTCUSDT", interval="1h", start=start_dt, end=end_dt, verbose=True)
+    if len(kl) == 0:
+        return kl
+    feat = build_daily_orderflow_features_from_klines(kl)
+    save_path = os.path.join(DATA_DIR, save_name)
+    feat.to_pickle(save_path)
+    print(f"[orderflow] saved: {save_path}, {len(feat):,} rows, {feat['datetime'].iloc[0]} ~ {feat['datetime'].iloc[-1]}")
+    return feat
+
+
 def _fetch_binance_ohlcv(symbol, timeframe, days_back, save_name):
     """Generic paginated fetcher for Binance via ccxt."""
     import ccxt
@@ -871,6 +889,8 @@ if __name__ == "__main__":
     parser.add_argument('--build-micro', action='store_true', help='Build microstructure features and save as cached bars')
     parser.add_argument('--fetch-daily-orderflow', action='store_true',
                         help='Fetch 5y daily orderflow features (taker buy volume from Binance klines)')
+    parser.add_argument('--fetch-1h-orderflow', action='store_true',
+                        help='Fetch 5y 1h orderflow features (taker buy volume from Binance klines)')
     args = parser.parse_args()
     if args.force:
         fetch_btc(args.freq, args.days)
@@ -892,3 +912,6 @@ if __name__ == "__main__":
 
     if args.fetch_daily_orderflow:
         fetch_btc_daily_orderflow(days_back=int(args.days))
+
+    if args.fetch_1h_orderflow:
+        fetch_btc_1h_orderflow(days_back=int(args.days))
