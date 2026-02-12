@@ -26,9 +26,11 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import roc_auc_score, accuracy_score
 
-from config.settings import TRAINING_CONFIG, RANDOM_SEED
+from config.settings import RANDOM_SEED, LGBM_CONFIG, XGB_CONFIG
 from utils.helpers import set_seed, ensure_dir
 from models.trainer import ModelTrainer, EarlyStopping
+from models.lgbm_model import LGBMModel
+from models.xgb_model import XGBModel
 from experiments.btc_data import (
     load_btc_orderflow,
     add_orderflow_microstructure_features,
@@ -90,13 +92,57 @@ def _add_basic_price_features(df: pd.DataFrame):
     return out
 
 
+def _seq_to_tabular_fast(X: np.ndarray, seq_length: int) -> np.ndarray:
+    """快速把 (N_rows, F) 转为 (N_samples, 3F)：last + mean + std（窗口长度=seq_length）。
+
+    这里的样本对齐与 create_sequences 保持一致：
+      - window: [i, i+seq_length)
+      - label : y[i+seq_length]
+    """
+    X = np.asarray(X, dtype=np.float32)
+    n_rows, n_feat = X.shape
+    seq_length = int(seq_length)
+    n_samples = n_rows - seq_length
+    if n_samples <= 0:
+        raise ValueError("seq_length 太大，无法生成样本")
+
+    # 累积和/平方和用 float64 降低数值误差
+    csum = np.cumsum(X.astype(np.float64), axis=0)
+    csum2 = np.cumsum((X.astype(np.float64) ** 2), axis=0)
+
+    end = np.arange(seq_length - 1, seq_length - 1 + n_samples)  # window 的最后一行 index
+    start_prev = np.arange(-1, n_samples - 1)                    # i-1
+
+    sum_end = csum[end]
+    sum2_end = csum2[end]
+    sum_prev = np.zeros((n_samples, n_feat), dtype=np.float64)
+    sum2_prev = np.zeros((n_samples, n_feat), dtype=np.float64)
+    mask = start_prev >= 0
+    sum_prev[mask] = csum[start_prev[mask]]
+    sum2_prev[mask] = csum2[start_prev[mask]]
+
+    win_sum = sum_end - sum_prev
+    win_sum2 = sum2_end - sum2_prev
+
+    mean = win_sum / seq_length
+    var = win_sum2 / seq_length - mean ** 2
+    var = np.maximum(var, 0.0)
+    std = np.sqrt(var)
+
+    last = X[end]  # (n_samples, n_feat)
+    tab = np.concatenate([last, mean.astype(np.float32), std.astype(np.float32)], axis=1).astype(np.float32)
+    return tab
+
+
 def main():
     parser = argparse.ArgumentParser(description="Orderflow microstructure + Deep NN runner")
     parser.add_argument("--freq", default="5min", choices=["5min", "1h", "daily"])
     parser.add_argument("--days", type=int, default=1825, help="回溯天数（默认 1825≈5年）")
 
     parser.add_argument("--model", default="orderflow_tcn",
-                        choices=["orderflow_tcn", "transformer_lstm", "lstm", "cnn", "mlp"])
+                        choices=["orderflow_tcn", "transformer_lstm", "lstm", "cnn", "mlp", "lgbm", "xgboost"])
+    parser.add_argument("--models", default=None,
+                        help="逗号分隔的模型列表，如 lgbm,xgboost,orderflow_tcn；不填则用 --model")
     parser.add_argument("--seq-length", type=int, default=60)
     parser.add_argument("--horizon", type=int, default=None, help="预测跨度（bar 数）；不填则按 freq 取默认")
     parser.add_argument("--label-mode", default="triple_barrier", choices=["binary", "triple_barrier"])
@@ -112,6 +158,8 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--clip", type=float, default=5.0, help="缩放后特征截断阈值（默认±5）")
+    parser.add_argument("--gbdt-rounds", type=int, default=2000)
+    parser.add_argument("--gbdt-early-stop", type=int, default=100)
 
     parser.add_argument("--gap", type=int, default=0, help="时间切分 gap（防止标签重叠泄露，单位=样本数）")
     parser.add_argument("--out-dir", default=os.path.join("results", "orderflow_runs"))
@@ -173,6 +221,10 @@ def main():
     df = df.copy()
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_localize(None)
     df = df.sort_values("datetime").reset_index(drop=True)
+    if args.days and args.days > 0:
+        end_dt = pd.to_datetime(df["datetime"].iloc[-1])
+        start_dt = end_dt - pd.Timedelta(days=int(args.days))
+        df = df[df["datetime"] >= start_dt].reset_index(drop=True)
 
     # 保证微观结构特征齐全（可覆盖不同窗口配置）
     if "bar_duration_sec" not in df.columns:
@@ -198,7 +250,7 @@ def main():
     # 清洗
     df_feat = df.dropna(subset=feature_cols + ["label"]).reset_index(drop=True)
     n_rows = len(df_feat)
-    if n_rows <= args.seq_length + 1000:
+    if n_rows <= args.seq_length + 50:
         raise ValueError(f"可用样本不足：rows={n_rows}, seq_length={args.seq_length}")
 
     X = df_feat[feature_cols].to_numpy(dtype=np.float32, copy=True)
@@ -210,6 +262,8 @@ def main():
     gap = int(max(args.gap, 0))
     val_start = min(val_end, train_end + gap)
     test_start = min(n_samples, val_end + gap)
+    if n_samples < 200 or train_end < 100 or (val_end - val_start) < 20 or (n_samples - test_start) < 20:
+        print("\n[WARN] 样本较少，训练/验证/测试切分可能不稳定；建议：减小 --seq-length 或增大 --days。")
 
     _print_kv("数据概览", {
         "freq": args.freq,
@@ -234,102 +288,176 @@ def main():
 
     trainer = ModelTrainer()
     pin_memory = (trainer.device.type == "cuda")
+    model_list = [args.model] if not args.models else [m.strip() for m in args.models.split(",") if m.strip()]
 
-    # ============ DataLoader（不构造全量 3D 张量） ============
-    train_ds = RollingWindowDataset(X, y, args.seq_length, 0, train_end)
-    val_ds = RollingWindowDataset(X, y, args.seq_length, val_start, val_end)
-    test_ds = RollingWindowDataset(X, y, args.seq_length, test_start, n_samples)
+    need_gbdt = any(m in ("lgbm", "xgboost") for m in model_list)
+    X_tab_all = None
+    y_samp = y[int(args.seq_length):int(args.seq_length) + n_samples].astype(np.int8, copy=False)
+    if need_gbdt:
+        print("\n[构造GBDT表格特征] last+mean+std (避免 3D 序列占用内存)")
+        X_tab_all = _seq_to_tabular_fast(X, int(args.seq_length))
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, drop_last=True, pin_memory=pin_memory)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, drop_last=False, pin_memory=pin_memory)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=args.num_workers, drop_last=False, pin_memory=pin_memory)
+    all_summaries = []
+    results_rows = []
 
-    # ============ 训练 ============
-    model = trainer._create_model(args.model, input_size=X.shape[1], seq_length=args.seq_length)
+    for mt in model_list:
+        set_seed(RANDOM_SEED)
+        mt_dir = os.path.join(run_dir, "models", mt)
+        ensure_dir(mt_dir)
+        mt_t0 = time.time()
 
-    pos_weight = trainer._compute_pos_weight(y[:fit_end_row])
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
-    early = EarlyStopping(patience=args.patience, min_delta=1e-4, mode="max")
+        if mt in ("lgbm", "xgboost"):
+            X_samp = X_tab_all
+            X_train = X_samp[:train_end]
+            y_train = y_samp[:train_end]
+            X_val = X_samp[val_start:val_end]
+            y_val = y_samp[val_start:val_end]
+            X_test = X_samp[test_start:n_samples]
+            y_test = y_samp[test_start:n_samples]
 
-    history = []
-    best_val_auc = 0.0
-    best_epoch = 0
-    print(f"\n[训练开始] device={trainer.device}, model={args.model}, batch={args.batch_size}, epochs={args.max_epochs}")
+            if mt == "lgbm":
+                model = LGBMModel(**LGBM_CONFIG)
+                model.fit(X_train, y_train, X_val, y_val,
+                          num_boost_round=int(args.gbdt_rounds),
+                          early_stopping_rounds=int(args.gbdt_early_stop))
+                val_probs = model.predict_proba(X_val)
+                test_probs = model.predict_proba(X_test)
+                import lightgbm as lgb
+                model_path = os.path.join(mt_dir, "lgbm.txt")
+                model.model.save_model(model_path)
+            else:
+                model = XGBModel(**XGB_CONFIG)
+                model.fit(X_train, y_train, X_val, y_val,
+                          num_boost_round=int(args.gbdt_rounds),
+                          early_stopping_rounds=int(args.gbdt_early_stop))
+                val_probs = model.predict_proba(X_val)
+                test_probs = model.predict_proba(X_test)
+                model_path = os.path.join(mt_dir, "xgb.json")
+                model.model.save_model(model_path)
 
-    for epoch in range(1, int(args.max_epochs) + 1):
-        ep0 = time.time()
-        train_loss, train_auc = trainer.train_epoch(model, train_loader, criterion, optimizer, clip_norm=1.0)
-        val_loss, val_auc, val_acc, _, _ = trainer.evaluate(model, val_loader, criterion)
-        scheduler.step(val_auc)
+            val_auc = roc_auc_score(y_val, val_probs) if len(set(y_val)) > 1 else 0.5
+            val_acc = accuracy_score(y_val, (np.array(val_probs) >= 0.5).astype(int))
+            test_auc = roc_auc_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.5
+            test_acc = accuracy_score(y_test, (np.array(test_probs) >= 0.5).astype(int))
 
-        history.append({
-            "epoch": epoch,
-            "train_loss": float(train_loss),
-            "train_auc": float(train_auc),
-            "val_loss": float(val_loss),
-            "val_auc": float(val_auc),
-            "val_acc": float(val_acc),
-            "sec": round(time.time() - ep0, 2),
-        })
+            mt_elapsed = round(time.time() - mt_t0, 1)
+            summary = {
+                "model": mt,
+                "val_auc": float(val_auc),
+                "val_acc": float(val_acc),
+                "test_auc": float(test_auc),
+                "test_acc": float(test_acc),
+                "elapsed_sec": mt_elapsed,
+                "artifact": model_path,
+            }
+            all_summaries.append(summary)
+            results_rows.append(summary)
+            print(f"\n[{mt}] val_auc={val_auc:.4f} val_acc={val_acc:.4f} test_auc={test_auc:.4f} test_acc={test_acc:.4f} time={mt_elapsed:.1f}s")
+            continue
 
-        if val_auc > best_val_auc:
-            best_val_auc = float(val_auc)
-            best_epoch = epoch
+        # ============ 深度模型：DataLoader（不构造全量 3D 张量） ============
+        train_ds = RollingWindowDataset(X, y, args.seq_length, 0, train_end)
+        val_ds = RollingWindowDataset(X, y, args.seq_length, val_start, val_end)
+        test_ds = RollingWindowDataset(X, y, args.seq_length, test_start, n_samples)
 
-        if epoch == 1 or epoch % 5 == 0:
-            print(f"[Epoch {epoch:03d}] train_loss={train_loss:.4f} train_auc={train_auc:.4f} "
-                  f"val_loss={val_loss:.4f} val_auc={val_auc:.4f} val_acc={val_acc:.4f} "
-                  f"time={history[-1]['sec']:.2f}s")
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=args.num_workers, drop_last=True, pin_memory=pin_memory)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_workers, drop_last=False, pin_memory=pin_memory)
+        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                                 num_workers=args.num_workers, drop_last=False, pin_memory=pin_memory)
 
-        early(val_auc, model)
-        if early.early_stop:
-            print(f"[早停] epoch={epoch}, best_val_auc={early.best_score:.4f}")
-            break
+        model = trainer._create_model(mt, input_size=X.shape[1], seq_length=args.seq_length)
 
-    if early.best_model_state:
-        model.load_state_dict(early.best_model_state)
+        pos_weight = trainer._compute_pos_weight(y[:fit_end_row])
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+        early = EarlyStopping(patience=args.patience, min_delta=1e-4, mode="max")
 
-    # ============ 测试 ============
-    test_loss, test_auc, test_acc, test_probs, test_labels = trainer.evaluate(model, test_loader, criterion)
+        history = []
+        best_val_auc = 0.0
+        best_epoch = 0
+        print(f"\n[训练开始] device={trainer.device}, model={mt}, batch={args.batch_size}, epochs={args.max_epochs}")
+
+        for epoch in range(1, int(args.max_epochs) + 1):
+            ep0 = time.time()
+            train_loss, train_auc = trainer.train_epoch(model, train_loader, criterion, optimizer, clip_norm=1.0)
+            val_loss, val_auc, val_acc, _, _ = trainer.evaluate(model, val_loader, criterion)
+            scheduler.step(val_auc)
+
+            history.append({
+                "epoch": epoch,
+                "train_loss": float(train_loss),
+                "train_auc": float(train_auc),
+                "val_loss": float(val_loss),
+                "val_auc": float(val_auc),
+                "val_acc": float(val_acc),
+                "sec": round(time.time() - ep0, 2),
+            })
+
+            if val_auc > best_val_auc:
+                best_val_auc = float(val_auc)
+                best_epoch = epoch
+
+            if epoch == 1 or epoch % 5 == 0:
+                print(f"[Epoch {epoch:03d}] train_loss={train_loss:.4f} train_auc={train_auc:.4f} "
+                      f"val_loss={val_loss:.4f} val_auc={val_auc:.4f} val_acc={val_acc:.4f} "
+                      f"time={history[-1]['sec']:.2f}s")
+
+            early(val_auc, model)
+            if early.early_stop:
+                print(f"[早停] epoch={epoch}, best_val_auc={early.best_score:.4f}")
+                break
+
+        if early.best_model_state:
+            model.load_state_dict(early.best_model_state)
+
+        test_loss, test_auc, test_acc, _, _ = trainer.evaluate(model, test_loader, criterion)
+        mt_elapsed = round(time.time() - mt_t0, 1)
+
+        # artifacts
+        torch.save(model.state_dict(), os.path.join(mt_dir, "model_state.pt"))
+        pd.DataFrame(history).to_csv(os.path.join(mt_dir, "history.csv"), index=False)
+
+        summary = {
+            "model": mt,
+            "val_best_auc": float(best_val_auc),
+            "val_best_epoch": int(best_epoch),
+            "test_auc": float(test_auc),
+            "test_acc": float(test_acc),
+            "test_loss": float(test_loss),
+            "elapsed_sec": mt_elapsed,
+            "artifact": f"{mt_dir}/model_state.pt",
+        }
+        with open(os.path.join(mt_dir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        all_summaries.append(summary)
+        results_rows.append(summary)
+
+        print(f"[{mt}] val_best_auc={best_val_auc:.4f} (epoch={best_epoch}) "
+              f"test_auc={test_auc:.4f} test_acc={test_acc:.4f} time={mt_elapsed:.1f}s")
+
     elapsed = round(time.time() - t0, 1)
+    pd.DataFrame(results_rows).to_csv(os.path.join(run_dir, "results.csv"), index=False)
+    with open(os.path.join(run_dir, "summary_all.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "run_dir": run_dir,
+            "elapsed_sec": elapsed,
+            "models": model_list,
+            "bars": int(n_rows),
+            "samples": int(n_samples),
+            "features": int(len(feature_cols)),
+            "seq_length": int(args.seq_length),
+            "horizon": int(args.horizon),
+            "label_mode": args.label_mode,
+            "results": all_summaries,
+        }, f, ensure_ascii=False, indent=2)
 
-    summary = {
-        "run_dir": run_dir,
+    _print_kv("总体总结", {
+        "models": ",".join(model_list),
         "elapsed_sec": elapsed,
-        "bars": int(n_rows),
-        "samples": int(n_samples),
-        "features": int(len(feature_cols)),
-        "seq_length": int(args.seq_length),
-        "horizon": int(args.horizon),
-        "label_mode": args.label_mode,
-        "val_best_auc": float(best_val_auc),
-        "val_best_epoch": int(best_epoch),
-        "test_auc": float(test_auc),
-        "test_acc": float(test_acc),
-        "test_loss": float(test_loss),
-    }
-
-    with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    pd.DataFrame(history).to_csv(os.path.join(run_dir, "history.csv"), index=False)
-
-    # 保存模型与 scaler（results/ 默认被 gitignore，不影响仓库）
-    torch.save(model.state_dict(), os.path.join(run_dir, "model_state.pt"))
-    with open(os.path.join(run_dir, "scaler.pkl"), "wb") as f:
-        import pickle
-        pickle.dump(scaler, f)
-
-    _print_kv("结果总结", {
-        "val_best_auc": f"{summary['val_best_auc']:.4f} (epoch={summary['val_best_epoch']})",
-        "test_auc": f"{summary['test_auc']:.4f}",
-        "test_acc": f"{summary['test_acc']:.4f}",
-        "elapsed_sec": summary["elapsed_sec"],
-        "artifacts": f"{run_dir}/(config.json, history.csv, summary.json, model_state.pt, scaler.pkl)",
+        "artifacts": f"{run_dir}/(config.json, results.csv, summary_all.json, models/...)",
     })
 
 

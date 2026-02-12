@@ -32,12 +32,12 @@ class XGBModel:
     def fit(self, X_train, y_train, X_val=None, y_val=None,
             num_boost_round=1000, early_stopping_rounds=50):
         """训练XGBoost"""
-        X_tr = self.seq_to_tabular(X_train)
+        X_tr = self.seq_to_tabular(X_train) if (isinstance(X_train, np.ndarray) and X_train.ndim == 3) else X_train
         dtrain = xgb.DMatrix(X_tr, label=y_train)
 
         evals = [(dtrain, 'train')]
         if X_val is not None:
-            X_v = self.seq_to_tabular(X_val)
+            X_v = self.seq_to_tabular(X_val) if (isinstance(X_val, np.ndarray) and X_val.ndim == 3) else X_val
             dval = xgb.DMatrix(X_v, label=y_val)
             evals.append((dval, 'val'))
 
