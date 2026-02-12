@@ -183,7 +183,8 @@ def main():
     parser.add_argument("--gbdt-rounds", type=int, default=2000)
     parser.add_argument("--gbdt-early-stop", type=int, default=100)
 
-    parser.add_argument("--gap", type=int, default=0, help="时间切分 gap（防止标签重叠泄露，单位=样本数）")
+    parser.add_argument("--gap", type=int, default=None,
+                        help="时间切分 gap（防止标签重叠泄露，单位=样本数）；不填则自动取 horizon")
     parser.add_argument("--out-dir", default=os.path.join("results", "orderflow_runs"))
     args = parser.parse_args()
 
@@ -196,6 +197,8 @@ def main():
             args.horizon = 24
         else:
             args.horizon = 12
+    if args.gap is None:
+        args.gap = int(args.horizon)
 
     pt_sl = tuple(float(x) for x in args.pt_sl.split(","))
     ensure_dir(args.out_dir)
@@ -222,7 +225,7 @@ def main():
             "weight_decay": args.weight_decay,
             "num_workers": args.num_workers,
             "clip": args.clip,
-            "gap": args.gap,
+            "gap": int(args.gap),
         }
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
@@ -282,7 +285,7 @@ def main():
     n_samples = n_rows - int(args.seq_length)
     train_end = int(n_samples * 0.7)
     val_end = int(n_samples * 0.85)
-    gap = int(max(args.gap, 0))
+    gap = int(max(int(args.gap), 0))
     val_start = min(val_end, train_end + gap)
     test_start = min(n_samples, val_end + gap)
     if n_samples < 200 or train_end < 100 or (val_end - val_start) < 20 or (n_samples - test_start) < 20:
@@ -295,6 +298,7 @@ def main():
         "features": len(feature_cols),
         "seq_length": args.seq_length,
         "samples(total)": n_samples,
+        "gap": gap,
         "split": f"train=0:{train_end}, val={val_start}:{val_end}, test={test_start}:{n_samples}",
         "label(up%)": f"{y.mean() * 100:.2f}%",
         "label_mode": args.label_mode,
