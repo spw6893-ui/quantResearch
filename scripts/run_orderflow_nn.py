@@ -7,7 +7,7 @@
   - 训练过程打印清晰，结束给出可复用的总结（JSON + 文本）
 
 推荐（BTC/USDT 5min, 5y）：
-  python3 scripts/run_orderflow_nn.py --freq 5min --days 1825 --model orderflow_tcn --label-mode triple_barrier --horizon 12
+  python3 -u scripts/run_orderflow_nn.py --freq 5min --days 1825 --model orderflow_tcn
 """
 import os
 import json
@@ -31,9 +31,6 @@ from utils.helpers import set_seed, ensure_dir
 from models.trainer import ModelTrainer, EarlyStopping
 from experiments.btc_data import (
     load_btc_orderflow,
-    fetch_btc_daily_orderflow,
-    fetch_btc_1h_orderflow,
-    fetch_btc_5min_orderflow,
     add_orderflow_microstructure_features,
     triple_barrier_label,
 )
@@ -97,7 +94,6 @@ def main():
     parser = argparse.ArgumentParser(description="Orderflow microstructure + Deep NN runner")
     parser.add_argument("--freq", default="5min", choices=["5min", "1h", "daily"])
     parser.add_argument("--days", type=int, default=1825, help="回溯天数（默认 1825≈5年）")
-    parser.add_argument("--auto-fetch", action="store_true", help="若缺少 orderflow 文件则自动拉取")
 
     parser.add_argument("--model", default="orderflow_tcn",
                         choices=["orderflow_tcn", "transformer_lstm", "lstm", "cnn", "mlp"])
@@ -166,16 +162,13 @@ def main():
     try:
         df = load_btc_orderflow(args.freq)
     except FileNotFoundError as e:
-        if not args.auto_fetch:
-            raise
-        print(f"[INFO] {e}，开始自动拉取…")
-        if args.freq == "daily":
-            fetch_btc_daily_orderflow(days_back=args.days)
-        elif args.freq == "1h":
-            fetch_btc_1h_orderflow(days_back=args.days)
-        else:
-            fetch_btc_5min_orderflow(days_back=args.days)
-        df = load_btc_orderflow(args.freq)
+        print(f"[ERROR] {e}")
+        print("[ERROR] 没有找到本地 orderflow 数据文件。若你已推送到仓库，请先在服务器执行 `git pull`。")
+        print("[ERROR] 若需要重新生成，可用：")
+        print("  - daily:  python3 -u experiments/btc_data.py --freq daily --fetch-daily-orderflow --days 1825")
+        print("  - 1h:     python3 -u experiments/btc_data.py --freq 1h --fetch-1h-orderflow --days 1825")
+        print("  - 5min:   python3 -u experiments/btc_data.py --freq 5min --fetch-5min-orderflow --days 1825")
+        raise SystemExit(2)
 
     df = df.copy()
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_localize(None)
