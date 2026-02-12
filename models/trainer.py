@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import (
     TRAINING_CONFIG, CV_CONFIG, OPTUNA_CONFIG, MODEL_DIR,
     TRANSFORMER_LSTM_CONFIG, LSTM_CONFIG, CNN_CONFIG, MLP_CONFIG, LGBM_CONFIG, XGB_CONFIG,
-    TFT_CONFIG, SEQUENCE_LENGTH, DEVICE, RANDOM_SEED
+    TFT_CONFIG, ORDERFLOW_TCN_CONFIG, SEQUENCE_LENGTH, DEVICE, RANDOM_SEED
 )
 from models.transformer_lstm import TransformerLSTM
 from models.lstm_model import LSTMModel
@@ -27,6 +27,7 @@ from models.mlp_model import MLPModel
 from models.lgbm_model import LGBMModel
 from models.xgb_model import XGBModel
 from models.tft_model import TemporalFusionTransformer
+from models.orderflow_tcn import OrderflowTCN
 from utils.logger import get_logger
 from utils.helpers import set_seed, ensure_dir
 
@@ -167,6 +168,17 @@ class ModelTrainer:
                 lstm_num_layers=config['lstm_num_layers'],
                 dropout=config['dropout'],
                 fc_hidden_size=config['fc_hidden_size'],
+            )
+        elif model_type == "orderflow_tcn":
+            config = {**ORDERFLOW_TCN_CONFIG, **kwargs}
+            model = OrderflowTCN(
+                input_size=input_size,
+                seq_length=seq_length,
+                hidden_channels=config["hidden_channels"],
+                kernel_size=config["kernel_size"],
+                dilations=config["dilations"],
+                dropout=config["dropout"],
+                fc_hidden_size=config["fc_hidden_size"],
             )
         elif model_type == "lgbm":
             config = {**LGBM_CONFIG, **kwargs}
@@ -603,7 +615,7 @@ class ModelTrainer:
                     cfg.MLP_CONFIG.update(arch)
                 logger.info(f"  {mt} 应用Optuna架构参数: {arch}")
 
-        model_types = ["lgbm", "xgboost", "transformer_lstm", "lstm", "cnn", "mlp"]
+        model_types = ["lgbm", "xgboost", "transformer_lstm", "lstm", "cnn", "mlp", "orderflow_tcn"]
         results = {}
 
         for mt in model_types:

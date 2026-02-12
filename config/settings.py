@@ -97,6 +97,15 @@ MLP_CONFIG = {
     "hidden_sizes": [256, 128, 64],
     "dropout": 0.3,
 }
+
+# Orderflow-TCN（适合微观结构特征，速度快）
+ORDERFLOW_TCN_CONFIG = {
+    "hidden_channels": 64,
+    "kernel_size": 3,
+    "dilations": [1, 2, 4, 8],
+    "dropout": 0.3,
+    "fc_hidden_size": 64,
+}
 # TFT (Temporal Fusion Transformer)
 TFT_CONFIG = {
     "d_model": 64,

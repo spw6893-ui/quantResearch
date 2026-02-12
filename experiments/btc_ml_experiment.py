@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from experiments.btc_data import (
     load_btc,
+    load_btc_orderflow,
     ALL_FREQS,
     triple_barrier_label,
     fetch_trades_ccxt,
@@ -137,6 +138,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="BTC ML Experiment")
     parser.add_argument('--freq', default='daily', choices=ALL_FREQS)
+    parser.add_argument('--data-mode', default='ohlcv', choices=['ohlcv', 'orderflow'],
+                        help='Data source: ohlcv (default) or orderflow (Binance klines taker-buy proxy)')
     parser.add_argument('--horizons', default=None, help='Comma-separated horizons (e.g., 1,7,14)')
     parser.add_argument('--models', default='lgbm,xgboost',
                         help='Comma-separated model types')
@@ -153,7 +156,10 @@ def main():
     parser.add_argument('--kyle-window', type=int, default=50)
     args = parser.parse_args()
 
-    df = load_btc(args.freq)
+    if args.data_mode == 'orderflow':
+        df = load_btc_orderflow(args.freq)
+    else:
+        df = load_btc(args.freq)
     print(f'Data: {len(df)} bars, {df["datetime"].iloc[0]} ~ {df["datetime"].iloc[-1]}')
 
     if args.micro:

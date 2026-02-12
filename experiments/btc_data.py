@@ -674,6 +674,108 @@ def build_orderflow_features_from_klines(
     return out
 
 
+def add_orderflow_microstructure_features(
+    df: pd.DataFrame,
+    vpin_window: int = 50,
+    kyle_window: int = 50,
+    eps: float = 1e-10,
+) -> pd.DataFrame:
+    """基于 orderflow(Klines 扩展字段) 增强微观结构特征。
+
+    目标：在没有历史 L2 orderbook 的情况下，提供接近“盘口微观结构”的可用代理特征：
+      - VPIN: 订单流不平衡的平滑度量
+      - Kyle's lambda: 价格冲击系数（用 signed_amount 近似）
+      - Amihud: 流动性/冲击代理（|ret| / dollar_volume）
+      - 交易强度：trades/sec、volume/sec
+    """
+    out = df.copy()
+    if len(out) == 0:
+        return out
+
+    # 基础列检查 / 兜底推导
+    if "bar_duration_sec" not in out.columns:
+        out["datetime"] = pd.to_datetime(out["datetime"], utc=True).dt.tz_localize(None)
+        dt = out["datetime"].diff().dt.total_seconds()
+        dur = float(dt.median()) if dt.notna().any() else np.nan
+        out["bar_duration_sec"] = dur
+
+    if "buy_volume" not in out.columns or "sell_volume" not in out.columns:
+        if "taker_buy_base" in out.columns and "volume" in out.columns:
+            out["buy_volume"] = out["taker_buy_base"].astype(float)
+            out["sell_volume"] = (out["volume"].astype(float) - out["buy_volume"]).clip(lower=0.0)
+        else:
+            return out
+
+    if "buy_amount" not in out.columns or "sell_amount" not in out.columns:
+        if "taker_buy_quote" in out.columns and "amount" in out.columns:
+            out["buy_amount"] = out["taker_buy_quote"].astype(float)
+            out["sell_amount"] = (out["amount"].astype(float) - out["buy_amount"]).clip(lower=0.0)
+        else:
+            out["buy_amount"] = out.get("buy_volume", 0.0) * 0.0
+            out["sell_amount"] = out.get("sell_volume", 0.0) * 0.0
+
+    out["signed_volume"] = out["buy_volume"].astype(float) - out["sell_volume"].astype(float)
+    out["ofi"] = out["signed_volume"] / (out["volume"].astype(float) + eps) if "volume" in out.columns else out.get("ofi", 0.0)
+
+    out["signed_amount"] = out["buy_amount"].astype(float) - out["sell_amount"].astype(float)
+    if "amount" in out.columns:
+        out["dollar_imbalance"] = out["signed_amount"] / (out["amount"].astype(float) + eps)
+
+    # VPIN（窗口内 |imbalance| 的均值）
+    total_vol = (out["buy_volume"].astype(float) + out["sell_volume"].astype(float))
+    imb_abs = out["signed_volume"].astype(float).abs() / (total_vol + eps)
+    out[f"vpin_{vpin_window}"] = imb_abs.rolling(int(vpin_window)).mean()
+
+    # Kyle's lambda：log-return ~ lambda * signed_amount
+    if "close" in out.columns:
+        logp = np.log(out["close"].astype(float).replace(0, np.nan))
+        r = logp.diff()
+        q = out["signed_amount"].astype(float)
+        cov_rq = r.rolling(int(kyle_window)).cov(q)
+        var_q = q.rolling(int(kyle_window)).var()
+        out[f"kyle_lambda_{kyle_window}"] = cov_rq / (var_q + eps)
+
+        # Amihud illiquidity proxy
+        if "amount" in out.columns:
+            ret = out["close"].astype(float).pct_change()
+            out["amihud_illiq"] = ret.abs() / (out["amount"].astype(float) + eps)
+
+    # close 相对成交 VWAP 的偏离（盘口压力代理）
+    if "vwap_trades" in out.columns and "close" in out.columns:
+        out["close_vwap_trades_ratio"] = out["close"].astype(float) / (out["vwap_trades"].astype(float) + eps)
+
+    # 交易强度
+    if "n_trades" in out.columns:
+        out["trades_per_sec"] = out["n_trades"].astype(float) / (out["bar_duration_sec"].astype(float) + eps)
+    if "volume" in out.columns:
+        out["volume_per_sec"] = out["volume"].astype(float) / (out["bar_duration_sec"].astype(float) + eps)
+
+    return out
+
+
+def load_btc_orderflow(freq: str) -> pd.DataFrame:
+    """加载已准备好的 orderflow 数据集（来自 Binance 扩展 Klines）。"""
+    if freq == "daily":
+        path = os.path.join(DATA_DIR, "btc_daily_orderflow.pkl")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"未找到 {path}，请先运行 --fetch-daily-orderflow")
+        df = pd.read_pickle(path)
+        return df
+    if freq == "1h":
+        path = os.path.join(DATA_DIR, "btc_1h_orderflow.pkl")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"未找到 {path}，请先运行 --fetch-1h-orderflow")
+        df = pd.read_pickle(path)
+        return df
+    if freq == "5min":
+        path = os.path.join(DATA_DIR, "btc_5min_orderflow.parquet")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"未找到 {path}，请先运行 --fetch-5min-orderflow")
+        df = pd.read_parquet(path)
+        return df
+    raise ValueError("orderflow 目前只支持 freq=daily/1h/5min")
+
+
 def fetch_btc_daily_orderflow(days_back: int = 1825, save_name: str = "btc_daily_orderflow.pkl") -> pd.DataFrame:
     """拉取 5 年（日线）taker buy 量等字段，并保存日级 orderflow 特征。"""
     # 取到最近一个完整 UTC 日（避免当天未收盘造成口径混乱）
@@ -684,6 +786,8 @@ def fetch_btc_daily_orderflow(days_back: int = 1825, save_name: str = "btc_daily
     if len(kl) == 0:
         return kl
     feat = build_orderflow_features_from_klines(kl, keep_raw_fields=True)
+    feat["bar_duration_sec"] = 86400.0
+    feat = add_orderflow_microstructure_features(feat)
     save_path = os.path.join(DATA_DIR, save_name)
     feat.to_pickle(save_path)
     print(f"[orderflow] saved: {save_path}, {len(feat):,} rows, {feat['datetime'].iloc[0]} ~ {feat['datetime'].iloc[-1]}")
@@ -702,6 +806,8 @@ def fetch_btc_1h_orderflow(days_back: int = 1825, save_name: str = "btc_1h_order
     if len(kl) == 0:
         return kl
     feat = build_orderflow_features_from_klines(kl, keep_raw_fields=True)
+    feat["bar_duration_sec"] = 3600.0
+    feat = add_orderflow_microstructure_features(feat)
     save_path = os.path.join(DATA_DIR, save_name)
     feat.to_pickle(save_path)
     print(f"[orderflow] saved: {save_path}, {len(feat):,} rows, {feat['datetime'].iloc[0]} ~ {feat['datetime'].iloc[-1]}")
@@ -732,6 +838,7 @@ def fetch_btc_5min_orderflow(
         return kl
     feat = build_orderflow_features_from_klines(kl, keep_raw_fields=False)
     feat["bar_duration_sec"] = 300.0
+    feat = add_orderflow_microstructure_features(feat)
 
     # 尽量压小体积，便于存储/推送
     for c in feat.columns:

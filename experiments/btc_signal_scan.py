@@ -8,6 +8,7 @@ from sklearn.metrics import roc_auc_score
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from experiments.btc_data import (
     load_btc,
+    load_btc_orderflow,
     fetch_btc,
     ALL_FREQS,
     triple_barrier_label,
@@ -248,6 +249,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="BTC TA Signal Mining")
     parser.add_argument('--freq', default='daily', choices=ALL_FREQS)
+    parser.add_argument('--data-mode', default='ohlcv', choices=['ohlcv', 'orderflow'],
+                        help='Data source: ohlcv (default) or orderflow (Binance klines taker-buy proxy)')
     parser.add_argument('--fetch', action='store_true', help='Force re-download data')
     parser.add_argument('--label-mode', default='binary', choices=['binary', 'triple_barrier'],
                         help='Labeling method: binary (next bar up/down) or triple_barrier (AFML)')
@@ -261,7 +264,9 @@ def main():
     parser.add_argument('--kyle-window', type=int, default=50)
     args = parser.parse_args()
 
-    if args.fetch:
+    if args.data_mode == 'orderflow':
+        df = load_btc_orderflow(args.freq)
+    elif args.fetch:
         df = fetch_btc(args.freq)
     else:
         df = load_btc(args.freq)
