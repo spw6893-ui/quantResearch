@@ -154,6 +154,54 @@ def _seq_to_tabular_fast(X: np.ndarray, seq_length: int) -> np.ndarray:
     return tab
 
 
+def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    y_true = np.asarray(y_true)
+    if len(y_true) == 0 or len(np.unique(y_true)) < 2:
+        return 0.5
+    return float(roc_auc_score(y_true, y_score))
+
+
+def _report_by_time_buckets(
+    times: np.ndarray,
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    bucket: str,
+) -> pd.DataFrame:
+    """按时间分桶统计（用于观察不同区间稳定性）。"""
+    ts = pd.to_datetime(times)
+    if bucket == "month":
+        keys = ts.to_period("M").astype(str)
+    elif bucket == "quarter":
+        keys = ts.to_period("Q").astype(str)
+    elif bucket == "year":
+        keys = ts.to_period("Y").astype(str)
+    else:
+        raise ValueError(f"未知 bucket: {bucket}")
+
+    df = pd.DataFrame({
+        "bucket": keys,
+        "y": np.asarray(y_true, dtype=np.int8),
+        "p": np.asarray(y_score, dtype=np.float32),
+    })
+
+    rows = []
+    for b, g in df.groupby("bucket", sort=True):
+        yb = g["y"].to_numpy()
+        pb = g["p"].to_numpy()
+        rows.append({
+            "bucket": b,
+            "n": int(len(g)),
+            "up_pct": float(yb.mean() * 100.0) if len(yb) else 0.0,
+            "auc": _safe_auc(yb, pb),
+            "acc": float(accuracy_score(yb, (pb >= 0.5).astype(int))) if len(yb) else 0.0,
+            "p_mean": float(np.mean(pb)) if len(pb) else 0.0,
+        })
+    out = pd.DataFrame(rows)
+    if len(out) > 0:
+        out["auc_edge_bps"] = (out["auc"] - 0.5) * 10000.0
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description="Orderflow microstructure + Deep NN runner")
     parser.add_argument("--freq", default="5min", choices=["5min", "1h", "daily"])
@@ -185,6 +233,8 @@ def main():
 
     parser.add_argument("--gap", type=int, default=None,
                         help="时间切分 gap（防止标签重叠泄露，单位=样本数）；不填则自动取 horizon")
+    parser.add_argument("--report-test-by", default="quarter",
+                        help="测试集按时间分桶统计：none 或 month,quarter,year（可逗号分隔，默认 quarter）")
     parser.add_argument("--out-dir", default=os.path.join("results", "orderflow_runs"))
     args = parser.parse_args()
 
@@ -281,6 +331,7 @@ def main():
 
     X = df_feat[feature_cols].to_numpy(dtype=np.float32, copy=True)
     y = df_feat["label"].to_numpy(dtype=np.int8, copy=True)
+    sample_times = df_feat["datetime"].iloc[int(args.seq_length):].reset_index(drop=True).to_numpy()
 
     n_samples = n_rows - int(args.seq_length)
     train_end = int(n_samples * 0.7)
@@ -317,6 +368,10 @@ def main():
     pin_memory = (trainer.device.type == "cuda")
     model_list = [args.model] if not args.models else [m.strip() for m in args.models.split(",") if m.strip()]
 
+    report_buckets = []
+    if args.report_test_by and str(args.report_test_by).strip() != "none":
+        report_buckets = [x.strip() for x in str(args.report_test_by).split(",") if x.strip()]
+
     need_gbdt = any(m in ("lgbm", "xgboost") for m in model_list)
     X_tab_all = None
     y_samp = y[int(args.seq_length):int(args.seq_length) + n_samples].astype(np.int8, copy=False)
@@ -341,6 +396,7 @@ def main():
             y_val = y_samp[val_start:val_end]
             X_test = X_samp[test_start:n_samples]
             y_test = y_samp[test_start:n_samples]
+            t_test = sample_times[test_start:n_samples]
 
             if mt == "lgbm":
                 model = LGBMModel(**LGBM_CONFIG)
@@ -380,6 +436,16 @@ def main():
             all_summaries.append(summary)
             results_rows.append(summary)
             print(f"\n[{mt}] val_auc={val_auc:.4f} val_acc={val_acc:.4f} test_auc={test_auc:.4f} test_acc={test_acc:.4f} time={mt_elapsed:.1f}s")
+
+            if report_buckets:
+                for b in report_buckets:
+                    rep = _report_by_time_buckets(t_test, y_test, test_probs, b)
+                    if len(rep) == 0:
+                        continue
+                    rep_path = os.path.join(mt_dir, f"test_by_{b}.csv")
+                    rep.to_csv(rep_path, index=False)
+                    print(f"[{mt}] test 分桶({b})已保存: {rep_path}")
+                    print(rep.head(12).to_string(index=False))
             continue
 
         # ============ 深度模型：DataLoader（不构造全量 3D 张量） ============
@@ -440,7 +506,7 @@ def main():
         if early.best_model_state:
             model.load_state_dict(early.best_model_state)
 
-        test_loss, test_auc, test_acc, _, _ = trainer.evaluate(model, test_loader, criterion)
+        test_loss, test_auc, test_acc, test_probs, test_labels = trainer.evaluate(model, test_loader, criterion)
         mt_elapsed = round(time.time() - mt_t0, 1)
 
         # artifacts
@@ -464,6 +530,17 @@ def main():
 
         print(f"[{mt}] val_best_auc={best_val_auc:.4f} (epoch={best_epoch}) "
               f"test_auc={test_auc:.4f} test_acc={test_acc:.4f} time={mt_elapsed:.1f}s")
+
+        if report_buckets:
+            t_test = sample_times[test_start:n_samples]
+            for b in report_buckets:
+                rep = _report_by_time_buckets(t_test, test_labels, test_probs, b)
+                if len(rep) == 0:
+                    continue
+                rep_path = os.path.join(mt_dir, f"test_by_{b}.csv")
+                rep.to_csv(rep_path, index=False)
+                print(f"[{mt}] test 分桶({b})已保存: {rep_path}")
+                print(rep.head(12).to_string(index=False))
 
     elapsed = round(time.time() - t0, 1)
     pd.DataFrame(results_rows).to_csv(os.path.join(run_dir, "results.csv"), index=False)
