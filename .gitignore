@@ -21,9 +21,6 @@ models/*.pth
 results/
 logs/
 
-# Local large datasets
-BTC_USDT:USDT_final.csv
-
 # Environment
 .env
 *.env
