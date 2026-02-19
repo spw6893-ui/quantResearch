@@ -315,6 +315,7 @@ def build_features(
     alpha101_list: str | None = None,
     alpha101_rank_window: int = 20,
     alpha101_adv_window: int = 20,
+    alpha101_window_scale: float = 1.0,
 ):
     """Build features and labels for a given horizon."""
     feature_set = (feature_set or "ta+hf").strip().lower()
@@ -364,7 +365,12 @@ def build_features(
             alphas = [int(x) for x in str(alpha101_list).split(",") if str(x).strip()]
         else:
             alphas = [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-        cfg = Alpha101Config(rank_window=int(alpha101_rank_window), adv_window=int(alpha101_adv_window), scale_window=int(alpha101_rank_window))
+        cfg = Alpha101Config(
+            rank_window=int(alpha101_rank_window),
+            adv_window=int(alpha101_adv_window),
+            scale_window=int(alpha101_rank_window),
+            window_scale=float(alpha101_window_scale),
+        )
         a_df = compute_alpha101_single(df, alphas=alphas, cfg=cfg, prefix="alpha101_")
         df = pd.concat([df, a_df], axis=1)
 
@@ -1381,6 +1387,7 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    alpha101_list: str | None = None,
                    alpha101_rank_window: int = 20,
                    alpha101_adv_window: int = 20,
+                   alpha101_window_scale: float = 1.0,
                    always_include_prefix: str | None = None,
                    always_include_cols: str | None = None,
                    no_select: bool = False,
@@ -1436,6 +1443,7 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         alpha101_list=alpha101_list,
         alpha101_rank_window=int(alpha101_rank_window),
         alpha101_adv_window=int(alpha101_adv_window),
+        alpha101_window_scale=float(alpha101_window_scale),
     )
     if len(df_feat) < 500:
         print(f"  Insufficient data ({len(df_feat)} rows), skipping")
@@ -1977,6 +1985,8 @@ def main():
                         help='Alpha101 中 rank/scale 的时间序列近似窗口（默认20）')
     parser.add_argument('--alpha101-adv-window', type=int, default=20,
                         help='Alpha101 中 adv 的窗口（默认20）')
+    parser.add_argument('--alpha101-window-scale', type=float, default=1.0,
+                        help='Alpha101 内部窗口缩放系数（默认1.0）。例如 0.25 会把 20→5、10→2，用于探索更短周期因子。')
     parser.add_argument('--always-include-prefix', type=str, default=None,
                         help='强制保留特征名前缀（逗号分隔），不受特征选择丢弃影响。例如: state_,alpha101_')
     parser.add_argument('--always-include-cols', type=str, default=None,
@@ -2127,6 +2137,7 @@ def main():
             alpha101_list=args.alpha101_list,
             alpha101_rank_window=int(args.alpha101_rank_window),
             alpha101_adv_window=int(args.alpha101_adv_window),
+            alpha101_window_scale=float(args.alpha101_window_scale),
             always_include_prefix=args.always_include_prefix,
             always_include_cols=args.always_include_cols,
             no_select=bool(args.no_select),

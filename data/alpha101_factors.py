@@ -119,6 +119,15 @@ class Alpha101Config:
     rank_window: int = 20
     adv_window: int = 20
     scale_window: int = 20
+    window_scale: float = 1.0
+
+    def w(self, n: int) -> int:
+        """按 window_scale 缩放窗口长度，并做最小值保护。"""
+        nn = int(n)
+        s = float(self.window_scale)
+        if not np.isfinite(s) or s <= 0:
+            raise ValueError("window_scale 需为正数")
+        return max(2, int(round(nn * s)))
 
 
 def compute_alpha101_single(
@@ -161,100 +170,119 @@ def compute_alpha101_single(
 
     # Alpha 1
     if 1 in alphas:
-        x = pd.Series(np.where(returns < 0, _ts_std(returns, 20), close), index=df.index)
-        a1 = rk(_ts_argmax(_signed_power(x, 2.0), 5)) - 0.5
+        w20 = cfg.w(20)
+        w5 = cfg.w(5)
+        x = pd.Series(np.where(returns < 0, _ts_std(returns, w20), close), index=df.index)
+        a1 = rk(_ts_argmax(_signed_power(x, 2.0), w5)) - 0.5
         out[f"{prefix}001"] = a1
 
     # Alpha 3
     if 3 in alphas:
-        out[f"{prefix}003"] = -_ts_corr(rk(open_), rk(volume), 10)
+        out[f"{prefix}003"] = -_ts_corr(rk(open_), rk(volume), cfg.w(10))
 
     # Alpha 4
     if 4 in alphas:
-        out[f"{prefix}004"] = -_rank_approx_minmax(rk(low), 9)
+        out[f"{prefix}004"] = -_rank_approx_minmax(rk(low), cfg.w(9))
 
     # Alpha 5
     if 5 in alphas:
-        a = open_ - (_ts_sum(vwap, 10) / 10.0)
+        w10 = cfg.w(10)
+        a = open_ - (_ts_sum(vwap, w10) / float(w10))
         b = close - vwap
         out[f"{prefix}005"] = rk(a) * (-np.abs(rk(b)))
 
     # Alpha 6
     if 6 in alphas:
-        out[f"{prefix}006"] = -_ts_corr(open_, volume, 10)
+        out[f"{prefix}006"] = -_ts_corr(open_, volume, cfg.w(10))
 
     # Alpha 7
     if 7 in alphas:
-        d7 = _delta(close, 7)
-        body = (-_rank_approx_minmax(np.abs(d7), 60)) * np.sign(d7)
+        w7 = cfg.w(7)
+        w60 = cfg.w(60)
+        d7 = _delta(close, w7)
+        body = (-_rank_approx_minmax(np.abs(d7), w60)) * np.sign(d7)
         out[f"{prefix}007"] = np.where(adv < volume, body, -1.0)
 
     # Alpha 8
     if 8 in alphas:
-        x = _ts_sum(open_, 5) * _ts_sum(returns, 5)
-        out[f"{prefix}008"] = -rk(x - _delay(x, 10))
+        w5 = cfg.w(5)
+        w10 = cfg.w(10)
+        x = _ts_sum(open_, w5) * _ts_sum(returns, w5)
+        out[f"{prefix}008"] = -rk(x - _delay(x, w10))
 
     # Alpha 9
     if 9 in alphas:
-        d1 = _delta(close, 1)
-        m1 = _ts_min(d1, 5)
-        m2 = _ts_max(d1, 5)
+        w1 = cfg.w(1)
+        w5 = cfg.w(5)
+        d1 = _delta(close, w1)
+        m1 = _ts_min(d1, w5)
+        m2 = _ts_max(d1, w5)
         a9 = np.where(0 < m1, d1, np.where(m2 < 0, d1, -d1))
         out[f"{prefix}009"] = a9
 
     # Alpha 10
     if 10 in alphas:
-        d1 = _delta(close, 1)
-        m1 = _ts_min(d1, 4)
-        m2 = _ts_max(d1, 4)
+        w1 = cfg.w(1)
+        w4 = cfg.w(4)
+        d1 = _delta(close, w1)
+        m1 = _ts_min(d1, w4)
+        m2 = _ts_max(d1, w4)
         a10 = np.where(0 < m1, d1, np.where(m2 < 0, d1, -d1))
         out[f"{prefix}010"] = rk(pd.Series(a10, index=df.index))
 
     # Alpha 11
     if 11 in alphas:
         x = vwap - close
-        out[f"{prefix}011"] = (rk(_ts_max(x, 3)) + rk(_ts_min(x, 3))) * rk(_delta(volume, 3))
+        w3 = cfg.w(3)
+        out[f"{prefix}011"] = (rk(_ts_max(x, w3)) + rk(_ts_min(x, w3))) * rk(_delta(volume, w3))
 
     # Alpha 12
     if 12 in alphas:
-        out[f"{prefix}012"] = np.sign(_delta(volume, 1)) * (-_delta(close, 1))
+        w1 = cfg.w(1)
+        out[f"{prefix}012"] = np.sign(_delta(volume, w1)) * (-_delta(close, w1))
 
     # Alpha 13
     if 13 in alphas:
-        out[f"{prefix}013"] = -rk(_ts_cov(rk(close), rk(volume), 5))
+        out[f"{prefix}013"] = -rk(_ts_cov(rk(close), rk(volume), cfg.w(5)))
 
     # Alpha 14
     if 14 in alphas:
-        out[f"{prefix}014"] = (-rk(_delta(returns, 3))) * _ts_corr(open_, volume, 10)
+        out[f"{prefix}014"] = (-rk(_delta(returns, cfg.w(3)))) * _ts_corr(open_, volume, cfg.w(10))
 
     # Alpha 15
     if 15 in alphas:
-        out[f"{prefix}015"] = -_ts_sum(rk(_ts_corr(rk(high), rk(volume), 3)), 3)
+        w3 = cfg.w(3)
+        out[f"{prefix}015"] = -_ts_sum(rk(_ts_corr(rk(high), rk(volume), w3)), w3)
 
     # Alpha 16
     if 16 in alphas:
-        out[f"{prefix}016"] = -rk(_ts_cov(rk(high), rk(volume), 5))
+        out[f"{prefix}016"] = -rk(_ts_cov(rk(high), rk(volume), cfg.w(5)))
 
     # Alpha 17
     if 17 in alphas:
-        out[f"{prefix}017"] = (-rk(_rank_approx_minmax(close, 10))) * rk(_delta(_delta(close, 1), 1)) * rk(_rank_approx_minmax(volume / (adv + EPS), 5))
+        w10 = cfg.w(10)
+        w1 = cfg.w(1)
+        w5 = cfg.w(5)
+        out[f"{prefix}017"] = (-rk(_rank_approx_minmax(close, w10))) * rk(_delta(_delta(close, w1), w1)) * rk(_rank_approx_minmax(volume / (adv + EPS), w5))
 
     # Alpha 18
     if 18 in alphas:
         x = (close - open_).abs()
-        out[f"{prefix}018"] = -rk((_ts_std(x, 5) + (close - open_)) + _ts_corr(close, open_, 10))
+        out[f"{prefix}018"] = -rk((_ts_std(x, cfg.w(5)) + (close - open_)) + _ts_corr(close, open_, cfg.w(10)))
 
     # Alpha 19
     if 19 in alphas:
-        out[f"{prefix}019"] = (-np.sign((close - _delay(close, 7)) + _delta(close, 7))) * (1.0 + rk(1.0 + _ts_sum(returns, 250)))
+        w7 = cfg.w(7)
+        w250 = cfg.w(250)
+        out[f"{prefix}019"] = (-np.sign((close - _delay(close, w7)) + _delta(close, w7))) * (1.0 + rk(1.0 + _ts_sum(returns, w250)))
 
     # Alpha 20
     if 20 in alphas:
-        out[f"{prefix}020"] = (-rk(open_ - _delay(high, 1))) * rk(open_ - _delay(close, 1)) * rk(open_ - _delay(low, 1))
+        w1 = cfg.w(1)
+        out[f"{prefix}020"] = (-rk(open_ - _delay(high, w1))) * rk(open_ - _delay(close, w1)) * rk(open_ - _delay(low, w1))
 
     # 尽量用 float32，节省内存
     for c in out.columns:
         out[c] = pd.to_numeric(out[c], errors="coerce").astype(np.float32)
 
     return out
-
