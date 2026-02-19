@@ -665,9 +665,10 @@ def _regime_cv_single_train_report(
         test_ratio=float(cv_cfg["test_ratio"]),
     )
     splits = splitter.split(len(X))
-    regimes = sorted([int(r) for r in np.unique(regime_s)])
+    # 只统计有效 regime（>=0）。缺失/不可用为 -1，会从 regime 覆盖率统计中剔除。
+    regimes = sorted([int(r) for r in np.unique(regime_s) if int(r) >= 0])
 
-    overall = {"val_auc": [], "test_auc": [], "test_acc": [], "test_n": []}
+    overall = {"val_auc": [], "test_auc": [], "test_acc": [], "test_n": [], "valid_test_n": []}
     per_r = {r: {"test_auc": [], "test_acc": [], "test_n": []} for r in regimes}
 
     for _, (train_idx, val_idx, test_idx) in enumerate(splits):
@@ -694,6 +695,8 @@ def _regime_cv_single_train_report(
         overall["test_n"].append(int(len(test_idx)))
 
         r_test = regime_s[test_idx]
+        valid_mask = r_test >= 0
+        overall["valid_test_n"].append(int(np.sum(valid_mask)))
         for r in regimes:
             m = r_test == r
             if not np.any(m):
@@ -716,11 +719,13 @@ def _regime_cv_single_train_report(
             "test_auc_std": float(np.std(overall["test_auc"])) if overall["test_auc"] else 0.0,
             "test_acc_mean": float(np.mean(overall["test_acc"])) if overall["test_acc"] else 0.0,
             "total_test_n": int(np.sum(overall["test_n"])) if overall["test_n"] else 0,
+            "total_valid_test_n": int(np.sum(overall["valid_test_n"])) if overall["valid_test_n"] else 0,
+            "dropped_test_n": int(np.sum(overall["test_n"])) - int(np.sum(overall["valid_test_n"])) if overall["test_n"] else 0,
         },
         "per_regime": {},
     }
 
-    total_test_n = out["overall"]["total_test_n"]
+    total_valid = int(out["overall"]["total_valid_test_n"])
     for r in regimes:
         ns = per_r[r]["test_n"]
         aucs = per_r[r]["test_auc"]
@@ -729,7 +734,7 @@ def _regime_cv_single_train_report(
         out["per_regime"][f"r{r}"] = {
             "folds_used": int(len(aucs)),
             "test_n": int(n_sum),
-            "coverage": float(n_sum / max(total_test_n, 1)),
+            "coverage": float(n_sum / max(total_valid, 1)),
             "test_auc_mean": float(np.mean(aucs)) if aucs else 0.0,
             "test_auc_std": float(np.std(aucs)) if aucs else 0.0,
             "test_acc_mean": float(np.mean(accs)) if accs else 0.0,
