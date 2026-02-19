@@ -384,8 +384,8 @@ class ModelTrainer:
 
     def cross_validate(self, model_type: str, X, y, cv_config: dict = None, model_params: dict | None = None, fit_params: dict | None = None) -> dict:
         """时间序列交叉验证"""
-        if cv_config is None:
-            cv_config = CV_CONFIG
+        # 允许传入部分覆盖参数（例如只覆盖 gap），其余字段从默认 CV_CONFIG 补齐
+        cv_config = {**CV_CONFIG, **(cv_config or {})}
 
         splitter = TimeSeriesSplitter(
             n_splits=cv_config['n_splits'],
