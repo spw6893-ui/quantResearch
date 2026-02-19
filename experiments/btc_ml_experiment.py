@@ -45,6 +45,18 @@ def load_hf_csv(csv_path: str) -> pd.DataFrame:
     df = df.dropna(subset=["datetime"]).drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
     if "amount" not in df.columns and all(c in df.columns for c in ("close", "volume")):
         df["amount"] = df["close"].astype(float) * df["volume"].astype(float)
+    # 尽量把 True/False 字段转成 0/1（避免后续特征选择/缩放遇到 object dtype）
+    obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    for c in obj_cols:
+        if c in ("datetime", "bar_end_time", "feature_time"):
+            continue
+        # 小集合才尝试判断（避免对高基数列浪费时间）
+        vals = df[c].dropna().astype(str).unique()
+        if len(vals) == 0 or len(vals) > 5:
+            continue
+        s = set(v.lower() for v in vals)
+        if s.issubset({"true", "false"}):
+            df[c] = df[c].astype(str).str.lower().map({"true": 1, "false": 0}).astype("int8")
     return df
 
 
@@ -118,8 +130,18 @@ def build_features(df, horizon, label_mode='binary', pt_sl=(1.0, 1.0), feature_s
 
     exclude = {'datetime', 'open', 'high', 'low', 'close', 'volume', 'amount',
                'label', 'future_return', 'tb_raw'}
-    feature_cols = [c for c in df.columns if c not in exclude and df[c].dtype in ('float64', 'float32', 'int64', 'int32')]
-    df = df.dropna(subset=feature_cols + ['label']).reset_index(drop=True)
+    # 注意：高频特征里普遍存在缺失值，不能用 dropna(feature_cols) 否则样本会被大量丢弃。
+    # 这里仅丢弃 label 为 NaN 的行；特征缺失交给后续 nan_to_num + RobustScaler 处理。
+    feature_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+
+    # 将 bool 转为 0/1，确保全是数值 dtype（FeatureEngineer.select_features 会用 numpy 直接取 values）
+    for c in feature_cols:
+        if pd.api.types.is_bool_dtype(df[c]):
+            df[c] = df[c].astype("int8")
+        elif not pd.api.types.is_numeric_dtype(df[c]):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=['label']).reset_index(drop=True)
     df['label'] = df['label'].astype(int)
     return df, feature_cols
 
@@ -128,6 +150,9 @@ def create_sequences(df, feature_cols, seq_length=60):
     """Create 3D sequences for deep learning models."""
     data = df[feature_cols].values
     labels = df['label'].values
+
+    # Replace inf/nan（高频特征缺失较多，必须先处理，否则 RobustScaler 直接报错）
+    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Scale (fit on first 70%)
     train_end = int(len(data) * 0.7)
