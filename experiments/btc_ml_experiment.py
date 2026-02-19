@@ -310,6 +310,10 @@ def build_features(
     add_state_features: bool = False,
     state_window: int = 48,
     state_funding_col: str | None = None,
+    add_alpha101: bool = False,
+    alpha101_list: str | None = None,
+    alpha101_rank_window: int = 20,
+    alpha101_adv_window: int = 20,
 ):
     """Build features and labels for a given horizon."""
     feature_set = (feature_set or "ta+hf").strip().lower()
@@ -347,6 +351,21 @@ def build_features(
             if c and c in df.columns:
                 df[f"state_{c}"] = pd.to_numeric(df[c], errors="coerce")
                 break
+
+    # Alpha101（单品种近似版）：结构化价格/成交量衍生因子
+    if bool(add_alpha101):
+        try:
+            from data.alpha101_factors import Alpha101Config, compute_alpha101_single
+        except Exception as e:
+            raise RuntimeError(f"导入 alpha101_factors 失败：{e}") from e
+
+        if alpha101_list:
+            alphas = [int(x) for x in str(alpha101_list).split(",") if str(x).strip()]
+        else:
+            alphas = [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        cfg = Alpha101Config(rank_window=int(alpha101_rank_window), adv_window=int(alpha101_adv_window), scale_window=int(alpha101_rank_window))
+        a_df = compute_alpha101_single(df, alphas=alphas, cfg=cfg, prefix="alpha101_")
+        df = pd.concat([df, a_df], axis=1)
 
     # 先计算 future_return，再构造 label；对最后 horizon 行显式置为 NaN 并丢弃，避免把未知标签误当成 0
     df['future_return'] = df['close'].shift(-horizon) / df['close'] - 1
@@ -1287,6 +1306,10 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    add_state_features: bool = False,
                    state_window: int = 48,
                    state_funding_col: str | None = None,
+                   add_alpha101: bool = False,
+                   alpha101_list: str | None = None,
+                   alpha101_rank_window: int = 20,
+                   alpha101_adv_window: int = 20,
                    no_select: bool = False,
                    select_method: str = "mutual_info",
                    max_features: int = MAX_FEATURES,
@@ -1335,6 +1358,10 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         add_state_features=bool(add_state_features),
         state_window=int(state_window),
         state_funding_col=state_funding_col,
+        add_alpha101=bool(add_alpha101),
+        alpha101_list=alpha101_list,
+        alpha101_rank_window=int(alpha101_rank_window),
+        alpha101_adv_window=int(alpha101_adv_window),
     )
     if len(df_feat) < 500:
         print(f"  Insufficient data ({len(df_feat)} rows), skipping")
@@ -1866,6 +1893,14 @@ def main():
                         help='连续状态特征窗口（用于 trend/vol），默认48')
     parser.add_argument('--state-funding-col', type=str, default=None,
                         help='资金费率类连续状态特征列名（可选；不填则自动在 funding_pressure/funding_rate/funding_annualized 中选）')
+    parser.add_argument('--add-alpha101', action='store_true',
+                        help='添加 Alpha101（单品种近似版）因子特征（默认 1,3~20；可用 --alpha101-list 自定义）')
+    parser.add_argument('--alpha101-list', type=str, default=None,
+                        help='Alpha101 因子编号列表（逗号分隔）。例如: 1,3,5,7,10；不填则默认 1,3~20')
+    parser.add_argument('--alpha101-rank-window', type=int, default=20,
+                        help='Alpha101 中 rank/scale 的时间序列近似窗口（默认20）')
+    parser.add_argument('--alpha101-adv-window', type=int, default=20,
+                        help='Alpha101 中 adv 的窗口（默认20）')
     parser.add_argument('--no-select', action='store_true', help='关闭特征选择，直接使用全部候选特征')
     parser.add_argument('--select-method', default='mutual_info', choices=['mutual_info', 'f_classif', 'random_forest'],
                         help='特征选择方法')
@@ -2005,6 +2040,10 @@ def main():
             add_state_features=bool(args.add_state_features),
             state_window=int(args.state_window),
             state_funding_col=args.state_funding_col,
+            add_alpha101=bool(args.add_alpha101),
+            alpha101_list=args.alpha101_list,
+            alpha101_rank_window=int(args.alpha101_rank_window),
+            alpha101_adv_window=int(args.alpha101_adv_window),
             no_select=bool(args.no_select),
             select_method=str(args.select_method),
             max_features=int(args.max_features),
