@@ -27,7 +27,7 @@ from config.settings import CV_CONFIG
 from data.feature_engineering import FeatureEngineer
 from models.lgbm_model import LGBMModel
 from models.xgb_model import XGBModel
-from models.trainer import ModelTrainer, EarlyStopping
+from models.trainer import ModelTrainer, EarlyStopping, TimeSeriesSplitter
 from utils.helpers import set_seed
 
 set_seed(RANDOM_SEED)
@@ -460,6 +460,195 @@ def _parse_json_dict(s: str | None, arg_name: str) -> dict | None:
     return obj
 
 
+def _compute_regime_row_labels(
+    df_feat: pd.DataFrame,
+    mode: str,
+    window: int,
+    bins: int,
+    train_end_idx: int,
+    regime_col: str | None = None,
+) -> np.ndarray:
+    """计算每一行(bar)的 regime 标签（row-level），后续再对齐到 sample-level。
+
+    mode:
+      - vol_quantile:  按 rolling 波动率分位数分桶（0..bins-1）
+      - trend_sign:    按 rolling 收益（window）正负分桶（0/1）
+      - funding_sign:  按资金费率(或指定列)正负分桶（0/1）
+    返回:
+      shape (n_rows,), int，缺失/不可用为 -1
+    """
+    mode = (mode or "none").strip().lower()
+    window = int(window)
+    bins = int(bins)
+    train_end_idx = int(train_end_idx)
+    n = len(df_feat)
+    out = np.full((n,), -1, dtype=np.int16)
+
+    if mode in ("none", ""):
+        return out
+
+    if mode == "vol_quantile":
+        if "close" not in df_feat.columns:
+            raise ValueError("regime=vol_quantile 需要 df_feat 包含 close 列")
+        ret1 = pd.to_numeric(df_feat["close"], errors="coerce").pct_change()
+        vol = ret1.rolling(window, min_periods=max(window // 2, 2)).std()
+        vol_tr = vol.iloc[:train_end_idx].dropna()
+        if len(vol_tr) < 100:
+            raise ValueError("regime=vol_quantile: 训练段有效样本太少，无法计算分位点")
+        qs = np.linspace(0.0, 1.0, bins + 1)
+        edges = vol_tr.quantile(qs).to_numpy()
+        # 处理分位点重复（极端情况下 vol 很平）
+        edges = np.unique(edges)
+        if len(edges) - 1 < bins:
+            # 退化：用中位数二分
+            med = float(vol_tr.median())
+            edges = np.array([float("-inf"), med, float("inf")], dtype=float)
+            bins = 2
+        # digitize: 用内部边界，把每个值映射到 0..bins-1
+        cut = edges[1:-1]
+        vv = vol.to_numpy()
+        ok = np.isfinite(vv)
+        out[ok] = np.digitize(vv[ok], cut, right=False).astype(np.int16)
+        return out
+
+    if mode == "trend_sign":
+        if "close" not in df_feat.columns:
+            raise ValueError("regime=trend_sign 需要 df_feat 包含 close 列")
+        mom = pd.to_numeric(df_feat["close"], errors="coerce").pct_change(window)
+        vv = mom.to_numpy()
+        ok = np.isfinite(vv)
+        out[ok] = (vv[ok] >= 0).astype(np.int16)
+        return out
+
+    if mode == "funding_sign":
+        col = (regime_col or "").strip()
+        if not col:
+            for c in ("funding_pressure", "funding_rate", "funding_annualized"):
+                if c in df_feat.columns:
+                    col = c
+                    break
+        if not col or col not in df_feat.columns:
+            raise ValueError("regime=funding_sign 需要 funding_pressure/funding_rate/funding_annualized 之一，或用 --regime-col 指定")
+        vv = pd.to_numeric(df_feat[col], errors="coerce").to_numpy()
+        ok = np.isfinite(vv)
+        out[ok] = (vv[ok] >= 0).astype(np.int16)
+        return out
+
+    raise ValueError("regime_mode 仅支持: none / vol_quantile / trend_sign / funding_sign")
+
+
+def _align_row_labels_to_samples(
+    row_labels: np.ndarray,
+    n_rows: int,
+    seq_length: int,
+    align: str,
+) -> np.ndarray:
+    """把 row-level 标签对齐到 sample-level（每个 sample 取 window 最后一行的标签）。"""
+    align = (align or "next").strip().lower()
+    if align not in ("next", "current"):
+        raise ValueError("align 仅支持: next / current")
+    n_rows = int(n_rows)
+    seq_length = int(seq_length)
+    n_samples = n_rows - seq_length + (1 if align == "current" else 0)
+    if n_samples <= 0:
+        raise ValueError("seq_length 太大，无法生成样本")
+    end_rows = np.arange(seq_length - 1, seq_length - 1 + n_samples)
+    return np.asarray(row_labels, dtype=np.int16)[end_rows]
+
+
+def _regime_cv_separate_train(
+    trainer: ModelTrainer,
+    model_type: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    regime_s: np.ndarray,
+    cv_cfg: dict,
+    model_params: dict | None,
+    fit_params: dict | None,
+    min_train: int,
+    min_val: int,
+    min_test: int,
+) -> dict:
+    """按 regime 分别训练（每折内、每个regime单独训练/评估），返回加权平均与各regime统计。"""
+    splitter = TimeSeriesSplitter(
+        n_splits=int(cv_cfg["n_splits"]),
+        gap=int(cv_cfg["gap"]),
+        val_ratio=float(cv_cfg["val_ratio"]),
+        test_ratio=float(cv_cfg["test_ratio"]),
+    )
+    splits = splitter.split(len(X))
+    regimes = sorted([int(r) for r in np.unique(regime_s) if int(r) >= 0])
+
+    per_r = {r: {"val_auc": [], "test_auc": [], "test_acc": [], "test_n": []} for r in regimes}
+
+    for fold_idx, (train_idx, val_idx, test_idx) in enumerate(splits):
+        train_idx = np.asarray(train_idx, dtype=np.int64)
+        val_idx = np.asarray(val_idx, dtype=np.int64)
+        test_idx = np.asarray(test_idx, dtype=np.int64)
+
+        for r in regimes:
+            m_tr = regime_s[train_idx] == r
+            m_va = regime_s[val_idx] == r
+            m_te = regime_s[test_idx] == r
+            tr = train_idx[m_tr]
+            va = val_idx[m_va]
+            te = test_idx[m_te]
+            if len(tr) < int(min_train) or len(va) < int(min_val) or len(te) < int(min_test):
+                continue
+
+            model, metrics = trainer.train_model(
+                model_type,
+                X[tr], y[tr],
+                X[va], y[va],
+                model_params=model_params,
+                fit_params=fit_params,
+            )
+            probs = model.predict_proba(X[te])
+            y_te = y[te]
+            test_auc = roc_auc_score(y_te, probs) if len(set(y_te)) > 1 else 0.5
+            test_acc = accuracy_score(y_te, (probs >= 0.5).astype(int))
+
+            per_r[r]["val_auc"].append(float(metrics.get("val_auc", 0.0)))
+            per_r[r]["test_auc"].append(float(test_auc))
+            per_r[r]["test_acc"].append(float(test_acc))
+            per_r[r]["test_n"].append(int(len(te)))
+
+    out = {"regimes": regimes, "per_regime": {}}
+    # 以各regime在各fold的 test 样本数为权重做加权平均（比简单平均更贴近整体表现）
+    total_n = 0
+    weighted_auc = 0.0
+    weighted_acc = 0.0
+    for r in regimes:
+        ns = per_r[r]["test_n"]
+        aucs = per_r[r]["test_auc"]
+        accs = per_r[r]["test_acc"]
+        n_sum = int(np.sum(ns)) if ns else 0
+        if n_sum > 0 and aucs:
+            # 先按 fold 内的 test_n 做加权，再汇总
+            w = np.asarray(ns, dtype=np.float64)
+            w = w / max(float(np.sum(w)), 1.0)
+            r_auc = float(np.sum(w * np.asarray(aucs, dtype=np.float64)))
+            r_acc = float(np.sum(w * np.asarray(accs, dtype=np.float64)))
+            weighted_auc += r_auc * n_sum
+            weighted_acc += r_acc * n_sum
+            total_n += n_sum
+
+        out["per_regime"][f"r{r}"] = {
+            "folds_used": int(len(aucs)),
+            "test_n": int(n_sum),
+            "val_auc_mean": float(np.mean(per_r[r]["val_auc"])) if per_r[r]["val_auc"] else 0.0,
+            "val_auc_std": float(np.std(per_r[r]["val_auc"])) if per_r[r]["val_auc"] else 0.0,
+            "test_auc_mean": float(np.mean(aucs)) if aucs else 0.0,
+            "test_auc_std": float(np.std(aucs)) if aucs else 0.0,
+            "test_acc_mean": float(np.mean(accs)) if accs else 0.0,
+        }
+
+    out["weighted_test_auc"] = float(weighted_auc / max(total_n, 1))
+    out["weighted_test_acc"] = float(weighted_acc / max(total_n, 1))
+    out["total_test_n"] = int(total_n)
+    return out
+
+
 class RollingWindowDataset(Dataset):
     """滚动窗口序列数据集：window = [s, s+seq_length)，label = y[s+seq_length]。
 
@@ -635,7 +824,15 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    cv_splits: int | None = None,
                    cv_gap: int | None = None,
                    cv_val_ratio: float | None = None,
-                   cv_test_ratio: float | None = None):
+                   cv_test_ratio: float | None = None,
+                   regime_mode: str = "none",
+                   regime_window: int = 48,
+                   regime_bins: int = 2,
+                   regime_col: str | None = None,
+                   regime_train: str = "single",
+                   regime_min_train: int = 2000,
+                   regime_min_val: int = 500,
+                   regime_min_test: int = 500):
     """Run single horizon experiment with multiple models."""
     df_feat, feature_cols = build_features(df, horizon, label_mode, pt_sl, feature_set=feature_set)
     if len(df_feat) < 500:
@@ -720,24 +917,76 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                         "test_ratio": float(cv_test_ratio) if cv_test_ratio is not None else None,
                     }
                     cv_cfg = {k: v for k, v in cfg.items() if v is not None}
-                    cv_out = trainer.cross_validate(
-                        mt, X, y,
-                        cv_config=cv_cfg if cv_cfg else None,
-                        model_params=model_params,
-                        fit_params=fit_params,
-                    )
-                    fold_results = cv_out.get("fold_results", [])
-                    fold_val_aucs = [float(r.get("val_auc", 0.0)) for r in fold_results]
-                    fold_test_aucs = [float(r.get("test_auc", 0.0)) for r in fold_results]
-                    avg_val_auc = float(np.mean([r.get("val_auc", 0.0) for r in fold_results])) if fold_results else 0.0
-                    results[f'{mt}_val_auc'] = avg_val_auc
-                    results[f'{mt}_test_auc'] = float(cv_out.get("avg_test_auc", 0.0))
-                    results[f'{mt}_test_acc'] = float(cv_out.get("avg_test_acc", 0.0))
-                    results[f'{mt}_time'] = round(time.time() - t0, 1)
-                    results[f'{mt}_cv_folds'] = int(len(fold_results))
-                    results[f'{mt}_val_auc_std'] = float(np.std(fold_val_aucs)) if fold_val_aucs else 0.0
-                    results[f'{mt}_test_auc_std'] = float(np.std(fold_test_aucs)) if fold_test_aucs else 0.0
-                    print(f"  {mt} (CV): folds={len(fold_results)}, avg_val_auc={avg_val_auc:.4f}, avg_test_auc={results[f'{mt}_test_auc']:.4f}, time={results[f'{mt}_time']:.1f}s")
+                    cv_cfg_full = {**CV_CONFIG, **(cv_cfg if cv_cfg else {})}
+
+                    regime_mode_n = (regime_mode or "none").strip().lower()
+                    regime_train_n = (regime_train or "single").strip().lower()
+                    if regime_mode_n != "none" and regime_train_n == "separate":
+                        train_end_idx = int(len(df_feat) * 0.7)
+                        row_reg = _compute_regime_row_labels(
+                            df_feat,
+                            mode=regime_mode_n,
+                            window=int(regime_window),
+                            bins=int(regime_bins),
+                            train_end_idx=train_end_idx,
+                            regime_col=regime_col,
+                        )
+                        reg_s = _align_row_labels_to_samples(row_reg, n_rows=len(df_feat), seq_length=int(seq_length), align=align)
+                        # 过滤缺失 regime 的样本（-1）
+                        good = reg_s >= 0
+                        Xg, yg, rg = X[good], y[good], reg_s[good]
+
+                        cv_out = _regime_cv_separate_train(
+                            trainer,
+                            model_type=mt,
+                            X=Xg, y=yg,
+                            regime_s=rg,
+                            cv_cfg=cv_cfg_full,
+                            model_params=model_params,
+                            fit_params=fit_params,
+                            min_train=int(regime_min_train),
+                            min_val=int(regime_min_val),
+                            min_test=int(regime_min_test),
+                        )
+                        results["regime_mode"] = regime_mode_n
+                        results["regime_window"] = int(regime_window)
+                        results["regime_bins"] = int(regime_bins)
+                        results["regime_train"] = "separate"
+
+                        results[f"{mt}_test_auc"] = float(cv_out.get("weighted_test_auc", 0.0))
+                        results[f"{mt}_test_acc"] = float(cv_out.get("weighted_test_acc", 0.0))
+                        results[f"{mt}_val_auc"] = 0.0  # regime separate 下 val/test 结构不同，先不输出整体 val
+                        results[f"{mt}_time"] = round(time.time() - t0, 1)
+                        results[f"{mt}_cv_folds"] = int(cv_cfg_full["n_splits"])
+                        results[f"{mt}_test_auc_std"] = 0.0
+                        results[f"{mt}_val_auc_std"] = 0.0
+
+                        print(f"  {mt} (CV, regime=separate): weighted_test_auc={results[f'{mt}_test_auc']:.4f}, total_test_n={cv_out.get('total_test_n', 0)}, time={results[f'{mt}_time']:.1f}s")
+                        for k, v in (cv_out.get("per_regime", {}) or {}).items():
+                            results[f"{mt}_{k}_test_auc"] = float(v.get("test_auc_mean", 0.0))
+                            results[f"{mt}_{k}_test_auc_std"] = float(v.get("test_auc_std", 0.0))
+                            results[f"{mt}_{k}_test_n"] = int(v.get("test_n", 0))
+                            results[f"{mt}_{k}_folds"] = int(v.get("folds_used", 0))
+                            print(f"    {k}: test_auc={v.get('test_auc_mean',0.0):.4f}±{v.get('test_auc_std',0.0):.4f}, test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}")
+                    else:
+                        cv_out = trainer.cross_validate(
+                            mt, X, y,
+                            cv_config=cv_cfg if cv_cfg else None,
+                            model_params=model_params,
+                            fit_params=fit_params,
+                        )
+                        fold_results = cv_out.get("fold_results", [])
+                        fold_val_aucs = [float(r.get("val_auc", 0.0)) for r in fold_results]
+                        fold_test_aucs = [float(r.get("test_auc", 0.0)) for r in fold_results]
+                        avg_val_auc = float(np.mean([r.get("val_auc", 0.0) for r in fold_results])) if fold_results else 0.0
+                        results[f'{mt}_val_auc'] = avg_val_auc
+                        results[f'{mt}_test_auc'] = float(cv_out.get("avg_test_auc", 0.0))
+                        results[f'{mt}_test_acc'] = float(cv_out.get("avg_test_acc", 0.0))
+                        results[f'{mt}_time'] = round(time.time() - t0, 1)
+                        results[f'{mt}_cv_folds'] = int(len(fold_results))
+                        results[f'{mt}_val_auc_std'] = float(np.std(fold_val_aucs)) if fold_val_aucs else 0.0
+                        results[f'{mt}_test_auc_std'] = float(np.std(fold_test_aucs)) if fold_test_aucs else 0.0
+                        print(f"  {mt} (CV): folds={len(fold_results)}, avg_val_auc={avg_val_auc:.4f}, avg_test_auc={results[f'{mt}_test_auc']:.4f}, time={results[f'{mt}_time']:.1f}s")
                 else:
                     n = len(X)
                     train_end = int(n * 0.7)
@@ -986,6 +1235,17 @@ def main():
     parser.add_argument('--cv-gap', type=int, default=None, help='CV gap（默认用 config.settings）')
     parser.add_argument('--cv-val-ratio', type=float, default=None, help='CV 验证集比例（默认用 config.settings）')
     parser.add_argument('--cv-test-ratio', type=float, default=None, help='CV 测试集比例（默认用 config.settings）')
+    parser.add_argument('--regime-mode', default='none',
+                        choices=['none', 'vol_quantile', 'trend_sign', 'funding_sign'],
+                        help='Regime 划分方式：none / vol_quantile / trend_sign / funding_sign')
+    parser.add_argument('--regime-window', type=int, default=48, help='regime rolling 窗口（用于 vol/trend）')
+    parser.add_argument('--regime-bins', type=int, default=2, help='regime 分桶数（仅用于 vol_quantile）')
+    parser.add_argument('--regime-col', type=str, default=None, help='regime 使用的列名（用于 funding_sign，可不填自动猜）')
+    parser.add_argument('--regime-train', default='single', choices=['single', 'separate'],
+                        help='regime 训练方式：single=全样本一个模型；separate=按regime分别训练')
+    parser.add_argument('--regime-min-train', type=int, default=2000, help='separate 训练时每个regime每折最小训练样本数')
+    parser.add_argument('--regime-min-val', type=int, default=500, help='separate 训练时每个regime每折最小验证样本数')
+    parser.add_argument('--regime-min-test', type=int, default=500, help='separate 训练时每个regime每折最小测试样本数')
     parser.add_argument('--label-mode', default='binary', choices=['binary', 'triple_barrier'],
                         help='Labeling method: binary or triple_barrier (AFML)')
     parser.add_argument('--pt-sl', default='1.0,1.0',
@@ -1093,6 +1353,14 @@ def main():
             cv_gap=args.cv_gap,
             cv_val_ratio=args.cv_val_ratio,
             cv_test_ratio=args.cv_test_ratio,
+            regime_mode=str(args.regime_mode),
+            regime_window=int(args.regime_window),
+            regime_bins=int(args.regime_bins),
+            regime_col=args.regime_col,
+            regime_train=str(args.regime_train),
+            regime_min_train=int(args.regime_min_train),
+            regime_min_val=int(args.regime_min_val),
+            regime_min_test=int(args.regime_min_test),
         )
         if result:
             all_results.append(result)
