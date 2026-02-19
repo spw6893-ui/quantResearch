@@ -61,17 +61,23 @@ def load_hf_csv(csv_path: str) -> pd.DataFrame:
 
 
 def _seq_to_tabular_fast(X_rows: np.ndarray, seq_length: int) -> np.ndarray:
-    """把 (N_rows, F) 快速转为 (N_samples, 3F)：last + mean + std（窗口长度=seq_length）。"""
+    """把 (N_rows, F) 快速转为 (N_samples, 3F)：last + mean + std（窗口长度=seq_length）。
+
+    对齐口径与 create_sequences 一致：用过去 seq_length 根预测“下一根”的 label。
+      - window: [s, s+seq_length)
+      - label : y[s+seq_length]
+    """
     X = np.asarray(X_rows, dtype=np.float32)
     n_rows, n_feat = X.shape
     seq_length = int(seq_length)
-    n_samples = n_rows - seq_length + 1
+    n_samples = n_rows - seq_length
     if n_samples <= 0:
         raise ValueError("seq_length 太大，无法生成样本")
 
     csum = np.cumsum(X.astype(np.float64), axis=0)
     csum2 = np.cumsum((X.astype(np.float64) ** 2), axis=0)
 
+    # window 的最后一行 index：seq_length-1 .. n_rows-2
     end = np.arange(seq_length - 1, seq_length - 1 + n_samples)
     start_prev = end - seq_length
 
@@ -93,6 +99,54 @@ def _seq_to_tabular_fast(X_rows: np.ndarray, seq_length: int) -> np.ndarray:
     last = X[end]
     return np.concatenate([last, mean.astype(np.float32), std.astype(np.float32)], axis=1).astype(np.float32)
 
+
+def _seq_to_tabular_nanaware(X_rows: np.ndarray, seq_length: int) -> np.ndarray:
+    """与 _seq_to_tabular_fast 相同，但对 NaN 做窗口内忽略（nanmean/nanstd），并保留 NaN。"""
+    X = np.asarray(X_rows, dtype=np.float32)
+    n_rows, n_feat = X.shape
+    seq_length = int(seq_length)
+    n_samples = n_rows - seq_length
+    if n_samples <= 0:
+        raise ValueError("seq_length 太大，无法生成样本")
+
+    isn = np.isnan(X)
+    X0 = np.where(isn, 0.0, X).astype(np.float32)
+    cnt = (~isn).astype(np.float32)
+
+    csum = np.cumsum(X0.astype(np.float64), axis=0)
+    csum2 = np.cumsum((X0.astype(np.float64) ** 2), axis=0)
+    ccnt = np.cumsum(cnt.astype(np.float64), axis=0)
+
+    end = np.arange(seq_length - 1, seq_length - 1 + n_samples)
+    start_prev = end - seq_length
+
+    sum_end = csum[end]
+    sum2_end = csum2[end]
+    cnt_end = ccnt[end]
+
+    sum_prev = np.zeros((n_samples, n_feat), dtype=np.float64)
+    sum2_prev = np.zeros((n_samples, n_feat), dtype=np.float64)
+    cnt_prev = np.zeros((n_samples, n_feat), dtype=np.float64)
+    mask = start_prev >= 0
+    sum_prev[mask] = csum[start_prev[mask]]
+    sum2_prev[mask] = csum2[start_prev[mask]]
+    cnt_prev[mask] = ccnt[start_prev[mask]]
+
+    win_sum = sum_end - sum_prev
+    win_sum2 = sum2_end - sum2_prev
+    win_cnt = cnt_end - cnt_prev
+
+    mean = np.full((n_samples, n_feat), np.nan, dtype=np.float32)
+    std = np.full((n_samples, n_feat), np.nan, dtype=np.float32)
+    valid = win_cnt > 0
+    mean[valid] = (win_sum[valid] / win_cnt[valid]).astype(np.float32)
+    var = np.zeros((n_samples, n_feat), dtype=np.float64)
+    var[valid] = win_sum2[valid] / win_cnt[valid] - (win_sum[valid] / win_cnt[valid]) ** 2
+    var = np.maximum(var, 0.0)
+    std[valid] = np.sqrt(var[valid]).astype(np.float32)
+
+    last = X[end]
+    return np.concatenate([last, mean, std], axis=1).astype(np.float32)
 
 def build_features(df, horizon, label_mode='binary', pt_sl=(1.0, 1.0), feature_set: str = "ta+hf"):
     """Build features and labels for a given horizon."""
@@ -169,27 +223,31 @@ def create_sequences(df, feature_cols, seq_length=60):
 
 
 def create_tabular(df, feature_cols, seq_length=60):
-    """Create 2D tabular features for GBDT models: last + mean + std, aligned to window end."""
+    """Create 2D tabular features for GBDT models: last + mean + std.
+
+    重要：对齐口径与深度模型一致（用过去 seq_length 预测下一根的 label）。
+    """
     X_rows = df[feature_cols].values
     y_rows = df["label"].values.astype(np.int64)
     X_rows = np.nan_to_num(X_rows, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
     n_rows = len(X_rows)
     seq_length = int(seq_length)
-    n_samples = n_rows - seq_length + 1
+    n_samples = n_rows - seq_length
     if n_samples <= 0:
         raise ValueError("seq_length 太大，无法生成样本")
 
     # 划分按样本比例，映射回行做 scaler fit，避免泄露
     train_end_s = int(n_samples * 0.7)
-    train_end_row = train_end_s + seq_length - 1
+    # 训练样本覆盖到的最后一行 index = (train_end_s-1)+seq_length-1 = train_end_s+seq_length-2
+    fit_end_row = max(train_end_s + seq_length - 2, 0)
     scaler = RobustScaler()
-    scaler.fit(X_rows[:train_end_row + 1])
+    scaler.fit(X_rows[:fit_end_row + 1])
     X_scaled = scaler.transform(X_rows).astype(np.float32)
     X_scaled = np.clip(X_scaled, -5, 5)
 
     X_tab = _seq_to_tabular_fast(X_scaled, seq_length=seq_length)
-    y = y_rows[seq_length - 1:]
+    y = y_rows[seq_length:]
     return X_tab, y
 
 
@@ -237,6 +295,41 @@ def _select_features_if_needed(
     train_end = int(len(df_feat) * 0.7)
     selected = fe.select_features(df_feat, method=select_method, max_features=int(max_features), train_end_idx=train_end)
     return selected
+
+
+def _prune_correlated_features(
+    df_feat: pd.DataFrame,
+    cols: list[str],
+    threshold: float,
+    method: str = "pearson",
+    train_end_idx: int | None = None,
+) -> list[str]:
+    """在训练段做共线性剪枝：按 cols 的顺序（通常已按重要性排序）贪心保留。"""
+    thr = float(threshold)
+    if not (0.0 < thr < 1.0):
+        raise ValueError("threshold 需在 (0,1) 内")
+    method = (method or "pearson").strip().lower()
+    if method not in ("pearson", "spearman"):
+        raise ValueError("corr method 仅支持 pearson/spearman")
+
+    if train_end_idx is None:
+        train_end_idx = int(len(df_feat) * 0.7)
+
+    sub = df_feat.iloc[:int(train_end_idx)][cols].copy()
+    sub = sub.apply(pd.to_numeric, errors="coerce")
+    med = sub.median(numeric_only=True)
+    sub = sub.fillna(med)
+
+    corr = sub.corr(method=method).abs().to_numpy()
+    keep_idx: list[int] = []
+    for i in range(len(cols)):
+        if not keep_idx:
+            keep_idx.append(i)
+            continue
+        mx = float(np.max(corr[i, keep_idx]))
+        if mx < thr:
+            keep_idx.append(i)
+    return [cols[i] for i in keep_idx]
 
 
 def _train_deep_with_loaders(
@@ -305,7 +398,9 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    no_select: bool = False,
                    select_method: str = "mutual_info",
                    max_features: int = MAX_FEATURES,
-                   batch_size: int | None = None):
+                   batch_size: int | None = None,
+                   prune_corr: float | None = None,
+                   corr_method: str = "pearson"):
     """Run single horizon experiment with multiple models."""
     df_feat, feature_cols = build_features(df, horizon, label_mode, pt_sl, feature_set=feature_set)
     if len(df_feat) < 500:
@@ -318,6 +413,16 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         select_method=str(select_method),
         max_features=int(max_features),
     )
+    if prune_corr is not None:
+        before = len(used_cols)
+        used_cols = _prune_correlated_features(
+            df_feat,
+            used_cols,
+            threshold=float(prune_corr),
+            method=str(corr_method),
+            train_end_idx=int(len(df_feat) * 0.7),
+        )
+        print(f"  共线性剪枝: {before} -> {len(used_cols)} (thr={float(prune_corr):.3f}, method={corr_method})")
     print(f"  Features: {len(used_cols)} (raw={len(feature_cols)}), Samples: {len(df_feat)}")
 
     gbdt_only = all(mt in ("lgbm", "xgboost") for mt in model_types)
@@ -389,7 +494,7 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         val_end_s = int(n_samples * 0.85)
 
         # scaler fit 到训练样本覆盖到的最后一行，避免泄露
-        fit_end_row = train_end_s + int(seq_length)
+        fit_end_row = max(train_end_s + int(seq_length) - 2, 0)
         scaler = RobustScaler()
         scaler.fit(X_rows[:fit_end_row + 1])
         X_rows = scaler.transform(X_rows).astype(np.float32)
@@ -525,6 +630,10 @@ def main():
                         help='特征选择方法')
     parser.add_argument('--max-features', type=int, default=MAX_FEATURES, help='特征选择保留上限')
     parser.add_argument('--batch-size', type=int, default=None, help='覆盖默认 batch_size（不填则用 config.settings）')
+    parser.add_argument('--prune-corr', type=float, default=None,
+                        help='对选择后的特征做共线性剪枝（训练段计算 abs(corr)；例如 0.98）')
+    parser.add_argument('--corr-method', default='pearson', choices=['pearson', 'spearman'],
+                        help='相关系数方法（用于 --prune-corr）')
     parser.add_argument('--label-mode', default='binary', choices=['binary', 'triple_barrier'],
                         help='Labeling method: binary or triple_barrier (AFML)')
     parser.add_argument('--pt-sl', default='1.0,1.0',
@@ -598,6 +707,8 @@ def main():
             select_method=str(args.select_method),
             max_features=int(args.max_features),
             batch_size=args.batch_size,
+            prune_corr=args.prune_corr,
+            corr_method=str(args.corr_method),
         )
         if result:
             all_results.append(result)
