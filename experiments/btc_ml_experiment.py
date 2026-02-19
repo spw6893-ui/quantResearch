@@ -306,6 +306,7 @@ def build_features(
     horizon,
     label_mode: str = "binary",
     pt_sl: tuple[float, float] = (1.0, 1.0),
+    label_threshold: float = 0.0,
     feature_set: str = "ta+hf",
     add_state_features: bool = False,
     state_window: int = 48,
@@ -376,9 +377,18 @@ def build_features(
         label[df['future_return'].isna() | pd.isna(tb)] = np.nan
         df['label'] = label
     else:
-        label = (df['future_return'] > 0).astype('float32')
-        label[df['future_return'].isna()] = np.nan
-        df['label'] = label
+        thr = float(label_threshold)
+        fr = pd.to_numeric(df["future_return"], errors="coerce")
+        if thr > 0:
+            # 二分类 + 死区：小幅波动视为“不可判定”，丢弃以降低噪声（AUC 会更“乐观”，但覆盖率降低）
+            label = pd.Series(np.nan, index=df.index, dtype="float32")
+            label[fr > thr] = 1.0
+            label[fr < -thr] = 0.0
+            df["label"] = label
+        else:
+            label = (fr > 0).astype('float32')
+            label[fr.isna()] = np.nan
+            df['label'] = label
 
     exclude = {'datetime', 'open', 'high', 'low', 'close', 'volume', 'amount',
                'label', 'future_return', 'tb_raw'}
@@ -393,7 +403,11 @@ def build_features(
         elif not pd.api.types.is_numeric_dtype(df[c]):
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    before_n = len(df)
     df = df.dropna(subset=['label']).reset_index(drop=True)
+    if label_mode != "triple_barrier" and float(label_threshold) > 0:
+        kept = len(df)
+        print(f"  Label deadzone: thr={float(label_threshold):.6f}, kept={kept}/{before_n} ({kept/max(before_n,1)*100:.1f}%)")
     df['label'] = df['label'].astype(int)
     return df, feature_cols
 
@@ -1359,6 +1373,7 @@ def _train_deep_with_loaders(
 def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary', pt_sl=(1.0, 1.0),
                    feature_set: str = "ta+hf", tabular: bool = False,
                    rolling_dataset: bool = False,
+                   label_threshold: float = 0.0,
                    add_state_features: bool = False,
                    state_window: int = 48,
                    state_funding_col: str | None = None,
@@ -1412,6 +1427,7 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         horizon,
         label_mode=label_mode,
         pt_sl=pt_sl,
+        label_threshold=float(label_threshold),
         feature_set=feature_set,
         add_state_features=bool(add_state_features),
         state_window=int(state_window),
@@ -2016,6 +2032,8 @@ def main():
                         help='trade_eval 下采样步长（减少 horizon 重叠带来的虚高）。默认=当前 horizon')
     parser.add_argument('--label-mode', default='binary', choices=['binary', 'triple_barrier'],
                         help='Labeling method: binary or triple_barrier (AFML)')
+    parser.add_argument('--label-threshold', type=float, default=0.0,
+                        help='二分类标签阈值（future_return 绝对值死区）。>0 时：y=1 if fr>thr, y=0 if fr<-thr, 否则丢弃；用于提升可预测性但会降低覆盖率。单位为收益率（例如 0.001=10bps）')
     parser.add_argument('--pt-sl', default='1.0,1.0',
                         help='Profit-take,stop-loss multipliers for triple barrier')
     parser.add_argument('--micro', action='store_true',
@@ -2098,6 +2116,7 @@ def main():
             seq_length=args.seq_length,
             label_mode=args.label_mode,
             pt_sl=pt_sl_vals,
+            label_threshold=float(args.label_threshold),
             feature_set=args.feature_set,
             tabular=bool(args.tabular),
             rolling_dataset=bool(args.rolling_dataset),
