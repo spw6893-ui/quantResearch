@@ -301,7 +301,16 @@ def _seq_to_tabular_rolling(
 
     return out
 
-def build_features(df, horizon, label_mode='binary', pt_sl=(1.0, 1.0), feature_set: str = "ta+hf"):
+def build_features(
+    df,
+    horizon,
+    label_mode: str = "binary",
+    pt_sl: tuple[float, float] = (1.0, 1.0),
+    feature_set: str = "ta+hf",
+    add_state_features: bool = False,
+    state_window: int = 48,
+    state_funding_col: str | None = None,
+):
     """Build features and labels for a given horizon."""
     feature_set = (feature_set or "ta+hf").strip().lower()
     if feature_set not in ("ta", "hf", "ta+hf"):
@@ -321,6 +330,23 @@ def build_features(df, horizon, label_mode='binary', pt_sl=(1.0, 1.0), feature_s
     else:
         # hf-only: 不添加 TA，只使用 CSV 自带的特征
         pass
+
+    # 连续“状态变量”(state)特征：不做 regime 分桶，让模型自己用连续阈值/交互学习
+    if bool(add_state_features):
+        if "close" in df.columns:
+            w = max(int(state_window), 2)
+            close = pd.to_numeric(df["close"], errors="coerce")
+            ret1 = close.pct_change()
+            df[f"state_trend_{w}"] = close.pct_change(w)
+            df[f"state_vol_{w}"] = ret1.rolling(w, min_periods=max(w // 2, 2)).std()
+        # funding 类：如果不指定列名，则优先选常见字段
+        fc = (str(state_funding_col).strip() if state_funding_col is not None else "")
+        cand = [fc] if fc else []
+        cand += ["funding_pressure", "funding_rate", "funding_annualized"]
+        for c in cand:
+            if c and c in df.columns:
+                df[f"state_{c}"] = pd.to_numeric(df[c], errors="coerce")
+                break
 
     # 先计算 future_return，再构造 label；对最后 horizon 行显式置为 NaN 并丢弃，避免把未知标签误当成 0
     df['future_return'] = df['close'].shift(-horizon) / df['close'] - 1
@@ -1258,6 +1284,9 @@ def _train_deep_with_loaders(
 def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary', pt_sl=(1.0, 1.0),
                    feature_set: str = "ta+hf", tabular: bool = False,
                    rolling_dataset: bool = False,
+                   add_state_features: bool = False,
+                   state_window: int = 48,
+                   state_funding_col: str | None = None,
                    no_select: bool = False,
                    select_method: str = "mutual_info",
                    max_features: int = MAX_FEATURES,
@@ -1297,7 +1326,16 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    regime_min_val: int = 500,
                    regime_min_test: int = 500):
     """Run single horizon experiment with multiple models."""
-    df_feat, feature_cols = build_features(df, horizon, label_mode, pt_sl, feature_set=feature_set)
+    df_feat, feature_cols = build_features(
+        df,
+        horizon,
+        label_mode=label_mode,
+        pt_sl=pt_sl,
+        feature_set=feature_set,
+        add_state_features=bool(add_state_features),
+        state_window=int(state_window),
+        state_funding_col=state_funding_col,
+    )
     if len(df_feat) < 500:
         print(f"  Insufficient data ({len(df_feat)} rows), skipping")
         return None
@@ -1822,6 +1860,12 @@ def main():
                         help='train/val/test 之间的样本间隔（embargo，防止相邻窗口强相关）。默认0；建议与 --cv-gap 同量级（例如10）。')
     parser.add_argument('--rolling-dataset', action='store_true',
                         help='深度模型使用滚动窗口 Dataset 动态取样（显著降低内存峰值；推荐 transformer/lstm 在大样本上用）')
+    parser.add_argument('--add-state-features', action='store_true',
+                        help='添加连续“状态变量”特征（trend/vol/funding 等），不做 regime 分桶，让模型自动学习分段/交互')
+    parser.add_argument('--state-window', type=int, default=48,
+                        help='连续状态特征窗口（用于 trend/vol），默认48')
+    parser.add_argument('--state-funding-col', type=str, default=None,
+                        help='资金费率类连续状态特征列名（可选；不填则自动在 funding_pressure/funding_rate/funding_annualized 中选）')
     parser.add_argument('--no-select', action='store_true', help='关闭特征选择，直接使用全部候选特征')
     parser.add_argument('--select-method', default='mutual_info', choices=['mutual_info', 'f_classif', 'random_forest'],
                         help='特征选择方法')
@@ -1958,6 +2002,9 @@ def main():
             feature_set=args.feature_set,
             tabular=bool(args.tabular),
             rolling_dataset=bool(args.rolling_dataset),
+            add_state_features=bool(args.add_state_features),
+            state_window=int(args.state_window),
+            state_funding_col=args.state_funding_col,
             no_select=bool(args.no_select),
             select_method=str(args.select_method),
             max_features=int(args.max_features),
