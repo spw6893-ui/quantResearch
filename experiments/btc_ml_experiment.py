@@ -647,15 +647,58 @@ def _regime_cv_separate_train(
     return out
 
 
+def _trade_stats_from_probs_and_future_return(
+    probs: np.ndarray,
+    future_return: np.ndarray,
+    mode: str,
+    long_thr: float,
+    short_thr: float,
+    cost_bps: float,
+) -> dict:
+    """最简交易统计（允许重叠持仓，按每个样本独立计算）。"""
+    probs = np.asarray(probs, dtype=np.float32)
+    fr = np.asarray(future_return, dtype=np.float32)
+    mode = (mode or "long").strip().lower()
+    if mode not in ("long", "long_short"):
+        raise ValueError("trade_mode 仅支持: long / long_short")
+    cost = float(cost_bps) / 10000.0
+
+    long_m = probs >= float(long_thr)
+    short_m = (probs <= float(short_thr)) if mode == "long_short" else np.zeros_like(long_m, dtype=bool)
+    trade_m = long_m | short_m
+    if not np.any(trade_m):
+        return {"trade_n": 0, "pnl_sum": 0.0, "pnl_mean": 0.0, "pnl_std": 0.0, "hit_sum": 0, "hit_rate": 0.0}
+
+    pnl = np.zeros_like(fr, dtype=np.float32)
+    pnl[long_m] = fr[long_m]
+    pnl[short_m] = -fr[short_m]
+    pnl = pnl[trade_m] - cost
+    return {
+        "trade_n": int(len(pnl)),
+        "pnl_sum": float(np.sum(pnl)),
+        "pnl_mean": float(np.mean(pnl)),
+        "pnl_std": float(np.std(pnl)),
+        "hit_sum": int(np.sum(pnl > 0)),
+        "hit_rate": float(np.mean(pnl > 0)),
+    }
+
+
 def _regime_cv_single_train_report(
     trainer: ModelTrainer,
     model_type: str,
     X: np.ndarray,
     y: np.ndarray,
     regime_s: np.ndarray,
+    future_return_s: np.ndarray,
     cv_cfg: dict,
     model_params: dict | None,
     fit_params: dict | None,
+    trade_eval: bool = False,
+    trade_mode: str = "long",
+    trade_long_thr: float = 0.55,
+    trade_short_thr: float = 0.45,
+    trade_cost_bps: float = 0.0,
+    trade_step: int = 1,
 ) -> dict:
     """单模型训练，但按 regime 输出每折 test AUC 与覆盖率（coverage）。"""
     splitter = TimeSeriesSplitter(
@@ -668,8 +711,14 @@ def _regime_cv_single_train_report(
     # 只统计有效 regime（>=0）。缺失/不可用为 -1，会从 regime 覆盖率统计中剔除。
     regimes = sorted([int(r) for r in np.unique(regime_s) if int(r) >= 0])
 
+    trade_step = max(int(trade_step), 1)
     overall = {"val_auc": [], "test_auc": [], "test_acc": [], "test_n": [], "valid_test_n": []}
     per_r = {r: {"test_auc": [], "test_acc": [], "test_n": [], "pos_sum": 0} for r in regimes}
+    per_r_trade = (
+        {r: {"sample_n": 0, "trade_n": 0, "pnl_sum": 0.0, "hit_sum": 0} for r in regimes}
+        if bool(trade_eval)
+        else None
+    )
 
     for _, (train_idx, val_idx, test_idx) in enumerate(splits):
         train_idx = np.asarray(train_idx, dtype=np.int64)
@@ -686,6 +735,7 @@ def _regime_cv_single_train_report(
 
         probs_all = model.predict_proba(X[test_idx])
         y_all = y[test_idx]
+        fr_all = np.asarray(future_return_s, dtype=np.float32)[test_idx]
         test_auc_all = roc_auc_score(y_all, probs_all) if len(set(y_all)) > 1 else 0.5
         test_acc_all = accuracy_score(y_all, (probs_all >= 0.5).astype(int))
 
@@ -697,6 +747,13 @@ def _regime_cv_single_train_report(
         r_test = regime_s[test_idx]
         valid_mask = r_test >= 0
         overall["valid_test_n"].append(int(np.sum(valid_mask)))
+
+        if trade_eval:
+            # 交易评估：可通过 trade_step 做“下采样”来减少重叠持仓带来的虚高
+            probs_trade = probs_all[::trade_step]
+            fr_trade = fr_all[::trade_step]
+            r_trade = r_test[::trade_step]
+
         for r in regimes:
             m = r_test == r
             if not np.any(m):
@@ -709,6 +766,22 @@ def _regime_cv_single_train_report(
             per_r[r]["test_acc"].append(float(acc_r))
             per_r[r]["test_n"].append(int(np.sum(m)))
             per_r[r]["pos_sum"] += int(np.sum(y_r))
+
+            if trade_eval:
+                mt = r_trade == r
+                if np.any(mt):
+                    per_r_trade[r]["sample_n"] += int(np.sum(mt))
+                    st = _trade_stats_from_probs_and_future_return(
+                        probs_trade[mt],
+                        fr_trade[mt],
+                        mode=str(trade_mode),
+                        long_thr=float(trade_long_thr),
+                        short_thr=float(trade_short_thr),
+                        cost_bps=float(trade_cost_bps),
+                    )
+                    per_r_trade[r]["trade_n"] += int(st["trade_n"])
+                    per_r_trade[r]["pnl_sum"] += float(st["pnl_sum"])
+                    per_r_trade[r]["hit_sum"] += int(st["hit_sum"])
 
     out = {
         "folds": int(len(splits)),
@@ -742,6 +815,15 @@ def _regime_cv_single_train_report(
             "test_auc_std": float(np.std(aucs)) if aucs else 0.0,
             "test_acc_mean": float(np.mean(accs)) if accs else 0.0,
         }
+        if trade_eval:
+            sn = int(per_r_trade[r]["sample_n"])
+            tn = int(per_r_trade[r]["trade_n"])
+            out["per_regime"][f"r{r}"]["trade_sample_n"] = sn
+            out["per_regime"][f"r{r}"]["trade_sample_coverage"] = float(sn / max(n_sum, 1))
+            out["per_regime"][f"r{r}"]["trade_n"] = tn
+            out["per_regime"][f"r{r}"]["trade_coverage"] = float(tn / max(sn, 1))
+            out["per_regime"][f"r{r}"]["trade_pnl_mean"] = float(per_r_trade[r]["pnl_sum"] / max(tn, 1))
+            out["per_regime"][f"r{r}"]["trade_hit_rate"] = float(per_r_trade[r]["hit_sum"] / max(tn, 1))
 
     return out
 
@@ -753,36 +835,41 @@ def _regime_cv_single_train_report_two(
     y: np.ndarray,
     regime1_s: np.ndarray,
     regime2_s: np.ndarray | None,
+    future_return_s: np.ndarray,
     cv_cfg: dict,
     model_params: dict | None,
     fit_params: dict | None,
+    trade_eval: bool = False,
+    trade_mode: str = "long",
+    trade_long_thr: float = 0.55,
+    trade_short_thr: float = 0.45,
+    trade_cost_bps: float = 0.0,
+    trade_step: int = 1,
 ) -> dict:
     """单模型训练；同时按两个 regime 输出 test AUC/覆盖率，并输出交叉(AND)分桶结果。"""
-    out1 = _regime_cv_single_train_report(
-        trainer,
-        model_type=model_type,
-        X=X,
-        y=y,
-        regime_s=regime1_s,
-        cv_cfg=cv_cfg,
-        model_params=model_params,
-        fit_params=fit_params,
-    )
+    # 如果没提供第二个regime，退化为单regime报表
     if regime2_s is None:
+        out1 = _regime_cv_single_train_report(
+            trainer,
+            model_type=model_type,
+            X=X,
+            y=y,
+            regime_s=regime1_s,
+            future_return_s=future_return_s,
+            cv_cfg=cv_cfg,
+            model_params=model_params,
+            fit_params=fit_params,
+            trade_eval=trade_eval,
+            trade_mode=trade_mode,
+            trade_long_thr=trade_long_thr,
+            trade_short_thr=trade_short_thr,
+            trade_cost_bps=trade_cost_bps,
+            trade_step=trade_step,
+        )
         return {"regime1": out1, "regime2": None, "intersection": None}
 
-    out2 = _regime_cv_single_train_report(
-        trainer,
-        model_type=model_type,
-        X=X,
-        y=y,
-        regime_s=regime2_s,
-        cv_cfg=cv_cfg,
-        model_params=model_params,
-        fit_params=fit_params,
-    )
+    trade_step = max(int(trade_step), 1)
 
-    # 交叉分桶：按 (r1, r2) 统计，采用“每折训练一次 -> 在 test 上按 mask 分桶”方式
     splitter = TimeSeriesSplitter(
         n_splits=int(cv_cfg["n_splits"]),
         gap=int(cv_cfg["gap"]),
@@ -791,65 +878,226 @@ def _regime_cv_single_train_report_two(
     )
     splits = splitter.split(len(X))
 
-    # 有效组合（>=0）
     r1_vals = sorted([int(r) for r in np.unique(regime1_s) if int(r) >= 0])
     r2_vals = sorted([int(r) for r in np.unique(regime2_s) if int(r) >= 0])
     pairs = [(a, b) for a in r1_vals for b in r2_vals]
+
+    overall = {"val_auc": [], "test_auc": [], "test_acc": [], "test_n": []}
+    valid1_n, valid2_n, valid12_n = [], [], []
+
+    per_r1 = {a: {"test_auc": [], "test_acc": [], "test_n": [], "pos_sum": 0} for a in r1_vals}
+    per_r2 = {b: {"test_auc": [], "test_acc": [], "test_n": [], "pos_sum": 0} for b in r2_vals}
     per_pair = {(a, b): {"test_auc": [], "test_acc": [], "test_n": [], "pos_sum": 0} for (a, b) in pairs}
-    valid_test_n = []
+
+    per_r1_trade = {a: {"sample_n": 0, "trade_n": 0, "pnl_sum": 0.0, "hit_sum": 0} for a in r1_vals} if trade_eval else None
+    per_r2_trade = {b: {"sample_n": 0, "trade_n": 0, "pnl_sum": 0.0, "hit_sum": 0} for b in r2_vals} if trade_eval else None
+    per_pair_trade = {(a, b): {"sample_n": 0, "trade_n": 0, "pnl_sum": 0.0, "hit_sum": 0} for (a, b) in pairs} if trade_eval else None
 
     for _, (train_idx, val_idx, test_idx) in enumerate(splits):
         train_idx = np.asarray(train_idx, dtype=np.int64)
         val_idx = np.asarray(val_idx, dtype=np.int64)
         test_idx = np.asarray(test_idx, dtype=np.int64)
 
-        model, _metrics = trainer.train_model(
+        model, metrics = trainer.train_model(
             model_type,
             X[train_idx], y[train_idx],
             X[val_idx], y[val_idx],
             model_params=model_params,
             fit_params=fit_params,
         )
+
         probs_all = model.predict_proba(X[test_idx])
         y_all = y[test_idx]
+        fr_all = np.asarray(future_return_s, dtype=np.float32)[test_idx]
         r1_test = regime1_s[test_idx]
         r2_test = regime2_s[test_idx]
-        vmask = (r1_test >= 0) & (r2_test >= 0)
-        valid_test_n.append(int(np.sum(vmask)))
+
+        overall["val_auc"].append(float(metrics.get("val_auc", 0.0)))
+        overall["test_auc"].append(float(roc_auc_score(y_all, probs_all) if len(set(y_all)) > 1 else 0.5))
+        overall["test_acc"].append(float(accuracy_score(y_all, (probs_all >= 0.5).astype(int))))
+        overall["test_n"].append(int(len(test_idx)))
+
+        valid1_n.append(int(np.sum(r1_test >= 0)))
+        valid2_n.append(int(np.sum(r2_test >= 0)))
+        valid12_n.append(int(np.sum((r1_test >= 0) & (r2_test >= 0))))
+
+        if trade_eval:
+            probs_tr = probs_all[::trade_step]
+            fr_tr = fr_all[::trade_step]
+            r1_tr = r1_test[::trade_step]
+            r2_tr = r2_test[::trade_step]
+
+        for a in r1_vals:
+            m = r1_test == a
+            if np.any(m):
+                y_m = y_all[m]
+                p_m = probs_all[m]
+                per_r1[a]["test_auc"].append(float(roc_auc_score(y_m, p_m) if len(set(y_m)) > 1 else 0.5))
+                per_r1[a]["test_acc"].append(float(accuracy_score(y_m, (p_m >= 0.5).astype(int))))
+                per_r1[a]["test_n"].append(int(np.sum(m)))
+                per_r1[a]["pos_sum"] += int(np.sum(y_m))
+            if trade_eval:
+                mt = r1_tr == a
+                if np.any(mt):
+                    per_r1_trade[a]["sample_n"] += int(np.sum(mt))
+                    st = _trade_stats_from_probs_and_future_return(
+                        probs_tr[mt],
+                        fr_tr[mt],
+                        mode=str(trade_mode),
+                        long_thr=float(trade_long_thr),
+                        short_thr=float(trade_short_thr),
+                        cost_bps=float(trade_cost_bps),
+                    )
+                    per_r1_trade[a]["trade_n"] += int(st["trade_n"])
+                    per_r1_trade[a]["pnl_sum"] += float(st["pnl_sum"])
+                    per_r1_trade[a]["hit_sum"] += int(st["hit_sum"])
+
+        for b in r2_vals:
+            m = r2_test == b
+            if np.any(m):
+                y_m = y_all[m]
+                p_m = probs_all[m]
+                per_r2[b]["test_auc"].append(float(roc_auc_score(y_m, p_m) if len(set(y_m)) > 1 else 0.5))
+                per_r2[b]["test_acc"].append(float(accuracy_score(y_m, (p_m >= 0.5).astype(int))))
+                per_r2[b]["test_n"].append(int(np.sum(m)))
+                per_r2[b]["pos_sum"] += int(np.sum(y_m))
+            if trade_eval:
+                mt = r2_tr == b
+                if np.any(mt):
+                    per_r2_trade[b]["sample_n"] += int(np.sum(mt))
+                    st = _trade_stats_from_probs_and_future_return(
+                        probs_tr[mt],
+                        fr_tr[mt],
+                        mode=str(trade_mode),
+                        long_thr=float(trade_long_thr),
+                        short_thr=float(trade_short_thr),
+                        cost_bps=float(trade_cost_bps),
+                    )
+                    per_r2_trade[b]["trade_n"] += int(st["trade_n"])
+                    per_r2_trade[b]["pnl_sum"] += float(st["pnl_sum"])
+                    per_r2_trade[b]["hit_sum"] += int(st["hit_sum"])
 
         for (a, b) in pairs:
             m = (r1_test == a) & (r2_test == b)
-            if not np.any(m):
-                continue
-            probs_p = probs_all[m]
-            y_p = y_all[m]
-            auc_p = roc_auc_score(y_p, probs_p) if len(set(y_p)) > 1 else 0.5
-            acc_p = accuracy_score(y_p, (probs_p >= 0.5).astype(int))
-            per_pair[(a, b)]["test_auc"].append(float(auc_p))
-            per_pair[(a, b)]["test_acc"].append(float(acc_p))
-            per_pair[(a, b)]["test_n"].append(int(np.sum(m)))
-            per_pair[(a, b)]["pos_sum"] += int(np.sum(y_p))
+            if np.any(m):
+                y_m = y_all[m]
+                p_m = probs_all[m]
+                per_pair[(a, b)]["test_auc"].append(float(roc_auc_score(y_m, p_m) if len(set(y_m)) > 1 else 0.5))
+                per_pair[(a, b)]["test_acc"].append(float(accuracy_score(y_m, (p_m >= 0.5).astype(int))))
+                per_pair[(a, b)]["test_n"].append(int(np.sum(m)))
+                per_pair[(a, b)]["pos_sum"] += int(np.sum(y_m))
+            if trade_eval:
+                mt = (r1_tr == a) & (r2_tr == b)
+                if np.any(mt):
+                    per_pair_trade[(a, b)]["sample_n"] += int(np.sum(mt))
+                    st = _trade_stats_from_probs_and_future_return(
+                        probs_tr[mt],
+                        fr_tr[mt],
+                        mode=str(trade_mode),
+                        long_thr=float(trade_long_thr),
+                        short_thr=float(trade_short_thr),
+                        cost_bps=float(trade_cost_bps),
+                    )
+                    per_pair_trade[(a, b)]["trade_n"] += int(st["trade_n"])
+                    per_pair_trade[(a, b)]["pnl_sum"] += float(st["pnl_sum"])
+                    per_pair_trade[(a, b)]["hit_sum"] += int(st["hit_sum"])
 
-    total_valid = int(np.sum(valid_test_n)) if valid_test_n else 0
-    inter = {"pairs": [], "per_pair": {}}
-    for (a, b) in pairs:
-        rec = per_pair[(a, b)]
-        ns = rec["test_n"]
-        aucs = rec["test_auc"]
-        accs = rec["test_acc"]
+    overall_summary = {
+        "val_auc_mean": float(np.mean(overall["val_auc"])) if overall["val_auc"] else 0.0,
+        "val_auc_std": float(np.std(overall["val_auc"])) if overall["val_auc"] else 0.0,
+        "test_auc_mean": float(np.mean(overall["test_auc"])) if overall["test_auc"] else 0.0,
+        "test_auc_std": float(np.std(overall["test_auc"])) if overall["test_auc"] else 0.0,
+        "test_acc_mean": float(np.mean(overall["test_acc"])) if overall["test_acc"] else 0.0,
+        "total_test_n": int(np.sum(overall["test_n"])) if overall["test_n"] else 0,
+    }
+
+    out1 = {"folds": int(len(splits)), "regimes": r1_vals, "overall": overall_summary, "per_regime": {}}
+    out2 = {"folds": int(len(splits)), "regimes": r2_vals, "overall": overall_summary, "per_regime": {}}
+    inter = {"pairs": [f"r{a}&r{b}" for (a, b) in pairs], "per_pair": {}}
+
+    total_valid1 = int(np.sum(valid1_n)) if valid1_n else 0
+    total_valid2 = int(np.sum(valid2_n)) if valid2_n else 0
+    total_valid12 = int(np.sum(valid12_n)) if valid12_n else 0
+
+    for a in r1_vals:
+        ns = per_r1[a]["test_n"]
+        aucs = per_r1[a]["test_auc"]
+        accs = per_r1[a]["test_acc"]
         n_sum = int(np.sum(ns)) if ns else 0
-        pos_sum = int(rec["pos_sum"])
-        key = f"r{a}&r{b}"
-        inter["pairs"].append(key)
-        inter["per_pair"][key] = {
+        pos_sum = int(per_r1[a]["pos_sum"])
+        rec = {
             "folds_used": int(len(aucs)),
             "test_n": int(n_sum),
-            "coverage": float(n_sum / max(total_valid, 1)),
+            "coverage": float(n_sum / max(total_valid1, 1)),
             "test_up_ratio": float(pos_sum / max(n_sum, 1)),
             "test_auc_mean": float(np.mean(aucs)) if aucs else 0.0,
             "test_auc_std": float(np.std(aucs)) if aucs else 0.0,
             "test_acc_mean": float(np.mean(accs)) if accs else 0.0,
         }
+        if trade_eval:
+            sn = int(per_r1_trade[a]["sample_n"])
+            tn = int(per_r1_trade[a]["trade_n"])
+            rec["trade_sample_n"] = sn
+            rec["trade_sample_coverage"] = float(sn / max(n_sum, 1))
+            rec["trade_n"] = tn
+            rec["trade_coverage"] = float(tn / max(sn, 1))
+            rec["trade_pnl_mean"] = float(per_r1_trade[a]["pnl_sum"] / max(tn, 1))
+            rec["trade_hit_rate"] = float(per_r1_trade[a]["hit_sum"] / max(tn, 1))
+        out1["per_regime"][f"r{a}"] = rec
+
+    for b in r2_vals:
+        ns = per_r2[b]["test_n"]
+        aucs = per_r2[b]["test_auc"]
+        accs = per_r2[b]["test_acc"]
+        n_sum = int(np.sum(ns)) if ns else 0
+        pos_sum = int(per_r2[b]["pos_sum"])
+        rec = {
+            "folds_used": int(len(aucs)),
+            "test_n": int(n_sum),
+            "coverage": float(n_sum / max(total_valid2, 1)),
+            "test_up_ratio": float(pos_sum / max(n_sum, 1)),
+            "test_auc_mean": float(np.mean(aucs)) if aucs else 0.0,
+            "test_auc_std": float(np.std(aucs)) if aucs else 0.0,
+            "test_acc_mean": float(np.mean(accs)) if accs else 0.0,
+        }
+        if trade_eval:
+            sn = int(per_r2_trade[b]["sample_n"])
+            tn = int(per_r2_trade[b]["trade_n"])
+            rec["trade_sample_n"] = sn
+            rec["trade_sample_coverage"] = float(sn / max(n_sum, 1))
+            rec["trade_n"] = tn
+            rec["trade_coverage"] = float(tn / max(sn, 1))
+            rec["trade_pnl_mean"] = float(per_r2_trade[b]["pnl_sum"] / max(tn, 1))
+            rec["trade_hit_rate"] = float(per_r2_trade[b]["hit_sum"] / max(tn, 1))
+        out2["per_regime"][f"r{b}"] = rec
+
+    for (a, b) in pairs:
+        rec0 = per_pair[(a, b)]
+        ns = rec0["test_n"]
+        aucs = rec0["test_auc"]
+        accs = rec0["test_acc"]
+        n_sum = int(np.sum(ns)) if ns else 0
+        pos_sum = int(rec0["pos_sum"])
+        key = f"r{a}&r{b}"
+        rec = {
+            "folds_used": int(len(aucs)),
+            "test_n": int(n_sum),
+            "coverage": float(n_sum / max(total_valid12, 1)),
+            "test_up_ratio": float(pos_sum / max(n_sum, 1)),
+            "test_auc_mean": float(np.mean(aucs)) if aucs else 0.0,
+            "test_auc_std": float(np.std(aucs)) if aucs else 0.0,
+            "test_acc_mean": float(np.mean(accs)) if accs else 0.0,
+        }
+        if trade_eval:
+            sn = int(per_pair_trade[(a, b)]["sample_n"])
+            tn = int(per_pair_trade[(a, b)]["trade_n"])
+            rec["trade_sample_n"] = sn
+            rec["trade_sample_coverage"] = float(sn / max(n_sum, 1))
+            rec["trade_n"] = tn
+            rec["trade_coverage"] = float(tn / max(sn, 1))
+            rec["trade_pnl_mean"] = float(per_pair_trade[(a, b)]["pnl_sum"] / max(tn, 1))
+            rec["trade_hit_rate"] = float(per_pair_trade[(a, b)]["hit_sum"] / max(tn, 1))
+        inter["per_pair"][key] = rec
 
     return {"regime1": out1, "regime2": out2, "intersection": inter}
 
@@ -1020,6 +1268,12 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    tabular_scale: str = "robust",
                    tabular_clip: float | None = 5.0,
                    align: str = "next",
+                   trade_eval: bool = False,
+                   trade_mode: str = "long",
+                   trade_long_thr: float = 0.55,
+                   trade_short_thr: float = 0.45,
+                   trade_cost_bps: float = 0.0,
+                   trade_step: int | None = None,
                    xgb_params: dict | None = None,
                    lgbm_params: dict | None = None,
                    xgb_fit_params: dict | None = None,
@@ -1057,6 +1311,10 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         print(f"  警告：--split-gap={eff_split_gap} < horizon={horizon}，边界附近样本可能存在未来信息泄露。建议设为 >= {horizon}。")
     if cv and eff_cv_gap < int(horizon):
         print(f"  警告：--cv-gap={eff_cv_gap} < horizon={horizon}，CV 边界附近样本可能存在未来信息泄露。建议设为 >= {horizon}。")
+
+    if trade_step is None:
+        trade_step = int(horizon)
+    trade_step = max(int(trade_step), 1)
 
     used_cols = _select_features_if_needed(
         df_feat, feature_cols,
@@ -1202,6 +1460,14 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                             )
                             reg2_s = _align_row_labels_to_samples(row_reg2, n_rows=len(df_feat), seq_length=int(seq_length), align=align)
 
+                        fr_rows = pd.to_numeric(df_feat["future_return"], errors="coerce").to_numpy(dtype=np.float32, copy=False)
+                        future_return_s = fr_rows[int(seq_length):] if align == "next" else fr_rows[int(seq_length) - 1:]
+                        if len(future_return_s) != len(y):
+                            raise RuntimeError(
+                                f"future_return_s 与样本长度不一致：len(future_return_s)={len(future_return_s)} vs len(y)={len(y)}。"
+                                f"（align={align}, seq_length={seq_length}, n_rows={len(df_feat)}）"
+                            )
+
                         cv_out2 = _regime_cv_single_train_report_two(
                             trainer,
                             model_type=mt,
@@ -1209,9 +1475,16 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                             y=y,
                             regime1_s=reg_s,
                             regime2_s=reg2_s,
+                            future_return_s=future_return_s,
                             cv_cfg=cv_cfg_full,
                             model_params=model_params,
                             fit_params=fit_params,
+                            trade_eval=bool(trade_eval),
+                            trade_mode=str(trade_mode),
+                            trade_long_thr=float(trade_long_thr),
+                            trade_short_thr=float(trade_short_thr),
+                            trade_cost_bps=float(trade_cost_bps),
+                            trade_step=int(trade_step),
                         )
 
                         results["regime_mode"] = regime_mode_n
@@ -1240,18 +1513,42 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                             results[f"{mt}_{k}_test_n"] = int(v.get("test_n", 0))
                             results[f"{mt}_{k}_folds"] = int(v.get("folds_used", 0))
                             results[f"{mt}_{k}_test_up_ratio"] = float(v.get("test_up_ratio", 0.0))
+                            if trade_eval:
+                                results[f"{mt}_{k}_trade_pnl_mean"] = float(v.get("trade_pnl_mean", 0.0))
+                                results[f"{mt}_{k}_trade_hit_rate"] = float(v.get("trade_hit_rate", 0.0))
+                                results[f"{mt}_{k}_trade_coverage"] = float(v.get("trade_coverage", 0.0))
                             print(
                                 f"    {k}: test_auc={v.get('test_auc_mean',0.0):.4f}±{v.get('test_auc_std',0.0):.4f}, "
                                 f"cov={v.get('coverage',0.0)*100:.1f}%, up={v.get('test_up_ratio',0.0)*100:.1f}%, "
                                 f"test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}"
+                                + (
+                                    f", trade_pnl_mean={v.get('trade_pnl_mean',0.0):.6f}, trade_hit={v.get('trade_hit_rate',0.0)*100:.1f}%, trade_cov={v.get('trade_coverage',0.0)*100:.1f}%"
+                                    if trade_eval
+                                    else ""
+                                )
                             )
                         if regime2_mode_n != "none":
                             print(f"  {mt} (regime2={regime2_mode_n}):")
                             for k, v in ((cv_out2.get("regime2", {}) or {}).get("per_regime", {}) or {}).items():
+                                results[f"{mt}_regime2_{k}_test_auc"] = float(v.get("test_auc_mean", 0.0))
+                                results[f"{mt}_regime2_{k}_test_auc_std"] = float(v.get("test_auc_std", 0.0))
+                                results[f"{mt}_regime2_{k}_coverage"] = float(v.get("coverage", 0.0))
+                                results[f"{mt}_regime2_{k}_test_n"] = int(v.get("test_n", 0))
+                                results[f"{mt}_regime2_{k}_folds"] = int(v.get("folds_used", 0))
+                                results[f"{mt}_regime2_{k}_test_up_ratio"] = float(v.get("test_up_ratio", 0.0))
+                                if trade_eval:
+                                    results[f"{mt}_regime2_{k}_trade_pnl_mean"] = float(v.get("trade_pnl_mean", 0.0))
+                                    results[f"{mt}_regime2_{k}_trade_hit_rate"] = float(v.get("trade_hit_rate", 0.0))
+                                    results[f"{mt}_regime2_{k}_trade_coverage"] = float(v.get("trade_coverage", 0.0))
                                 print(
                                     f"    {k}: test_auc={v.get('test_auc_mean',0.0):.4f}±{v.get('test_auc_std',0.0):.4f}, "
                                     f"cov={v.get('coverage',0.0)*100:.1f}%, up={v.get('test_up_ratio',0.0)*100:.1f}%, "
                                     f"test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}"
+                                    + (
+                                        f", trade_pnl_mean={v.get('trade_pnl_mean',0.0):.6f}, trade_hit={v.get('trade_hit_rate',0.0)*100:.1f}%, trade_cov={v.get('trade_coverage',0.0)*100:.1f}%"
+                                        if trade_eval
+                                        else ""
+                                    )
                                 )
                             inter = cv_out2.get("intersection", {}) or {}
                             per_pair = inter.get("per_pair", {}) or {}
@@ -1261,10 +1558,25 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                                 items = list(per_pair.items())
                                 items.sort(key=lambda kv: float(kv[1].get("test_auc_mean", 0.0)), reverse=True)
                                 for key, v in items[:6]:
+                                    results[f"{mt}_inter_{key}_test_auc"] = float(v.get("test_auc_mean", 0.0))
+                                    results[f"{mt}_inter_{key}_test_auc_std"] = float(v.get("test_auc_std", 0.0))
+                                    results[f"{mt}_inter_{key}_coverage"] = float(v.get("coverage", 0.0))
+                                    results[f"{mt}_inter_{key}_test_n"] = int(v.get("test_n", 0))
+                                    results[f"{mt}_inter_{key}_folds"] = int(v.get("folds_used", 0))
+                                    results[f"{mt}_inter_{key}_test_up_ratio"] = float(v.get("test_up_ratio", 0.0))
+                                    if trade_eval:
+                                        results[f"{mt}_inter_{key}_trade_pnl_mean"] = float(v.get("trade_pnl_mean", 0.0))
+                                        results[f"{mt}_inter_{key}_trade_hit_rate"] = float(v.get("trade_hit_rate", 0.0))
+                                        results[f"{mt}_inter_{key}_trade_coverage"] = float(v.get("trade_coverage", 0.0))
                                     print(
                                         f"    {key}: test_auc={v.get('test_auc_mean',0.0):.4f}±{v.get('test_auc_std',0.0):.4f}, "
                                         f"cov={v.get('coverage',0.0)*100:.1f}%, up={v.get('test_up_ratio',0.0)*100:.1f}%, "
                                         f"test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}"
+                                        + (
+                                            f", trade_pnl_mean={v.get('trade_pnl_mean',0.0):.6f}, trade_hit={v.get('trade_hit_rate',0.0)*100:.1f}%, trade_cov={v.get('trade_coverage',0.0)*100:.1f}%"
+                                            if trade_eval
+                                            else ""
+                                        )
                                     )
                     else:
                         cv_out = trainer.cross_validate(
@@ -1550,6 +1862,15 @@ def main():
     parser.add_argument('--regime-min-train', type=int, default=2000, help='separate 训练时每个regime每折最小训练样本数')
     parser.add_argument('--regime-min-val', type=int, default=500, help='separate 训练时每个regime每折最小验证样本数')
     parser.add_argument('--regime-min-test', type=int, default=500, help='separate 训练时每个regime每折最小测试样本数')
+    parser.add_argument('--trade-eval', action='store_true',
+                        help='在 regime 报表中输出最简交易统计（用 future_return 近似；默认每个样本独立计算）')
+    parser.add_argument('--trade-mode', default='long', choices=['long', 'long_short'],
+                        help='交易方向：long=仅做多；long_short=多空')
+    parser.add_argument('--trade-long-thr', type=float, default=0.55, help='做多阈值：prob>=thr 触发开仓')
+    parser.add_argument('--trade-short-thr', type=float, default=0.45, help='做空阈值：prob<=thr 触发开仓（仅 long_short）')
+    parser.add_argument('--trade-cost-bps', type=float, default=0.0, help='单笔交易成本（bps），会从每笔样本 PnL 扣减')
+    parser.add_argument('--trade-step', type=int, default=None,
+                        help='trade_eval 下采样步长（减少 horizon 重叠带来的虚高）。默认=当前 horizon')
     parser.add_argument('--label-mode', default='binary', choices=['binary', 'triple_barrier'],
                         help='Labeling method: binary or triple_barrier (AFML)')
     parser.add_argument('--pt-sl', default='1.0,1.0',
@@ -1647,6 +1968,12 @@ def main():
             tabular_scale=str(args.tabular_scale),
             tabular_clip=(None if float(args.tabular_clip) <= 0 else float(args.tabular_clip)),
             align=str(args.align),
+            trade_eval=bool(args.trade_eval),
+            trade_mode=str(args.trade_mode),
+            trade_long_thr=float(args.trade_long_thr),
+            trade_short_thr=float(args.trade_short_thr),
+            trade_cost_bps=float(args.trade_cost_bps),
+            trade_step=args.trade_step,
             xgb_params=xgb_params,
             lgbm_params=lgbm_params,
             xgb_fit_params=xgb_fit_params,
