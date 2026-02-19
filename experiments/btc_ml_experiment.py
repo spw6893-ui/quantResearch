@@ -153,6 +153,7 @@ def _seq_to_tabular_rolling(
     X_rows: np.ndarray,
     seq_length: int,
     agg: str,
+    align: str = "next",
 ) -> np.ndarray:
     """用滚动和的方式把 (N_rows, F) 转为 tabular（更省内存）。
 
@@ -169,7 +170,10 @@ def _seq_to_tabular_rolling(
     X = np.asarray(X_rows, dtype=np.float32)
     n_rows, n_feat = X.shape
     seq_length = int(seq_length)
-    n_samples = n_rows - seq_length
+    align = (align or "next").strip().lower()
+    if align not in ("next", "current"):
+        raise ValueError("align 仅支持: next / current")
+    n_samples = n_rows - seq_length + (1 if align == "current" else 0)
     if n_samples <= 0:
         raise ValueError("seq_length 太大，无法生成样本")
 
@@ -192,7 +196,7 @@ def _seq_to_tabular_rolling(
     win_cnt[:] = np.sum(m_init, axis=0).astype(np.float64)
 
     for s in range(n_samples):
-        end_row = s + seq_length - 1
+        end_row = s + seq_length - 1  # align=next/current 都是 window 的最后一行
         last = X[end_row]
 
         if agg == "last":
@@ -287,8 +291,16 @@ def build_features(df, horizon, label_mode='binary', pt_sl=(1.0, 1.0), feature_s
     return df, feature_cols
 
 
-def create_sequences(df, feature_cols, seq_length=60):
-    """Create 3D sequences for deep learning models."""
+def create_sequences(df, feature_cols, seq_length=60, align: str = "next"):
+    """Create 3D sequences for deep learning models.
+
+    align:
+      - next:  用过去 seq_length 根（到 t-1）预测标签 t（默认，最严格因果）
+      - current: 用过去 seq_length 根（到 t）预测标签 t（更常见的 bar-close 口径）
+    """
+    align = (align or "next").strip().lower()
+    if align not in ("next", "current"):
+        raise ValueError("align 仅支持: next / current")
     data = df[feature_cols].values
     labels = df['label'].values
 
@@ -303,9 +315,16 @@ def create_sequences(df, feature_cols, seq_length=60):
     data = np.clip(data, -5, 5)
 
     X, y = [], []
-    for i in range(seq_length, len(data)):
-        X.append(data[i - seq_length:i])
-        y.append(labels[i])
+    if align == "next":
+        start = seq_length
+        for i in range(start, len(data)):
+            X.append(data[i - seq_length:i])
+            y.append(labels[i])
+    else:
+        start = seq_length - 1
+        for i in range(start, len(data)):
+            X.append(data[i - seq_length + 1:i + 1])
+            y.append(labels[i])
     return np.array(X, dtype=np.float32), np.array(y)
 
 
@@ -316,6 +335,7 @@ def create_tabular(
     tabular_agg: str = "last_mean_std",
     tabular_scale: str = "robust",
     tabular_clip: float | None = 5.0,
+    align: str = "next",
 ):
     """Create 2D tabular features for GBDT models: last + mean + std.
 
@@ -328,7 +348,10 @@ def create_tabular(
 
     n_rows = len(X_rows)
     seq_length = int(seq_length)
-    n_samples = n_rows - seq_length
+    align = (align or "next").strip().lower()
+    if align not in ("next", "current"):
+        raise ValueError("align 仅支持: next / current")
+    n_samples = n_rows - seq_length + (1 if align == "current" else 0)
     if n_samples <= 0:
         raise ValueError("seq_length 太大，无法生成样本")
 
@@ -353,8 +376,8 @@ def create_tabular(
             X_rows = np.clip(X_rows, -clip_v, clip_v)
 
     # 用 rolling 版本生成 tabular，避免 _seq_to_tabular_fast 的 cumsum/cumsum2 大矩阵引发 OOM
-    X_tab = _seq_to_tabular_rolling(X_rows, seq_length=seq_length, agg=tabular_agg)
-    y = y_rows[seq_length:]
+    X_tab = _seq_to_tabular_rolling(X_rows, seq_length=seq_length, agg=tabular_agg, align=align)
+    y = y_rows[seq_length:] if align == "next" else y_rows[seq_length - 1:]
     return X_tab, y
 
 
@@ -364,15 +387,26 @@ class RollingWindowDataset(Dataset):
     对齐方式与本项目 create_sequences 保持一致（用过去 seq_length 根预测“下一根”的 label）。
     """
 
-    def __init__(self, X_rows: np.ndarray, y_rows: np.ndarray, seq_length: int, start: int, end: int):
+    def __init__(
+        self,
+        X_rows: np.ndarray,
+        y_rows: np.ndarray,
+        seq_length: int,
+        start: int,
+        end: int,
+        align: str = "next",
+    ):
         self.X_rows = np.asarray(X_rows, dtype=np.float32)
         self.y_rows = np.asarray(y_rows, dtype=np.float32)
         self.seq_length = int(seq_length)
         self.start = int(start)
         self.end = int(end)
+        self.align = (align or "next").strip().lower()
+        if self.align not in ("next", "current"):
+            raise ValueError("RollingWindowDataset: align 仅支持 next/current")
 
         n_rows = len(self.X_rows)
-        n_samples = n_rows - self.seq_length
+        n_samples = n_rows - self.seq_length + (1 if self.align == "current" else 0)
         if n_samples <= 0:
             raise ValueError("seq_length 太大，无法生成样本")
         if not (0 <= self.start <= self.end <= n_samples):
@@ -384,7 +418,8 @@ class RollingWindowDataset(Dataset):
     def __getitem__(self, idx: int):
         s = self.start + int(idx)
         x = self.X_rows[s:s + self.seq_length]
-        y = self.y_rows[s + self.seq_length]
+        label_idx = s + (self.seq_length if self.align == "next" else self.seq_length - 1)
+        y = self.y_rows[label_idx]
         return torch.from_numpy(x), torch.tensor(float(y), dtype=torch.float32)
 
 
@@ -510,7 +545,13 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    corr_method: str = "pearson",
                    tabular_agg: str = "last_mean_std",
                    tabular_scale: str = "robust",
-                   tabular_clip: float | None = 5.0):
+                   tabular_clip: float | None = 5.0,
+                   align: str = "next",
+                   cv: bool = False,
+                   cv_splits: int | None = None,
+                   cv_gap: int | None = None,
+                   cv_val_ratio: float | None = None,
+                   cv_test_ratio: float | None = None):
     """Run single horizon experiment with multiple models."""
     df_feat, feature_cols = build_features(df, horizon, label_mode, pt_sl, feature_set=feature_set)
     if len(df_feat) < 500:
@@ -541,6 +582,9 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         raise ValueError("tabular 模式仅支持 lgbm/xgboost")
 
     trainer = ModelTrainer()
+    align = (align or "next").strip().lower()
+    if align not in ("next", "current"):
+        raise ValueError("align 仅支持: next / current")
 
     # ============ 1) GBDT（默认 tabular） ============
     if use_tabular:
@@ -551,39 +595,57 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
             tabular_agg=tabular_agg,
             tabular_scale=tabular_scale,
             tabular_clip=tabular_clip,
+            align=align,
         )
-        n = len(X)
-        train_end = int(n * 0.7)
-        val_end = int(n * 0.85)
-        X_train, y_train = X[:train_end], y[:train_end]
-        X_val, y_val = X[train_end:val_end], y[train_end:val_end]
-        X_test, y_test = X[val_end:], y[val_end:]
-
-        print(f"  Split: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-        print(f"  Label dist: up={y_test.mean()*100:.1f}%")
-
         results = {
             'horizon': horizon,
             'n_features': len(used_cols),
-            'n_train': len(X_train),
-            'n_test': len(X_test),
-            'test_up_ratio': y_test.mean(),
+            'n_train': int(len(X) * 0.7),
+            'n_test': int(len(X) - int(len(X) * 0.85)),
+            'test_up_ratio': float(np.mean(y[int(len(y) * 0.85):])) if len(y) else 0.0,
         }
 
         for mt in model_types:
             t0 = time.time()
             try:
-                model, metrics = trainer.train_model(mt, X_train, y_train, X_val, y_val)
-                test_probs = model.predict_proba(X_test)
-                test_auc = roc_auc_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.5
-                test_acc = accuracy_score(y_test, (test_probs >= 0.5).astype(int))
-                elapsed = time.time() - t0
+                if cv:
+                    cfg = {
+                        "n_splits": int(cv_splits) if cv_splits is not None else None,
+                        "gap": int(cv_gap) if cv_gap is not None else None,
+                        "val_ratio": float(cv_val_ratio) if cv_val_ratio is not None else None,
+                        "test_ratio": float(cv_test_ratio) if cv_test_ratio is not None else None,
+                    }
+                    cv_cfg = {k: v for k, v in cfg.items() if v is not None}
+                    cv_out = trainer.cross_validate(mt, X, y, cv_config=cv_cfg if cv_cfg else None)
+                    fold_results = cv_out.get("fold_results", [])
+                    avg_val_auc = float(np.mean([r.get("val_auc", 0.0) for r in fold_results])) if fold_results else 0.0
+                    results[f'{mt}_val_auc'] = avg_val_auc
+                    results[f'{mt}_test_auc'] = float(cv_out.get("avg_test_auc", 0.0))
+                    results[f'{mt}_test_acc'] = float(cv_out.get("avg_test_acc", 0.0))
+                    results[f'{mt}_time'] = round(time.time() - t0, 1)
+                    results[f'{mt}_cv_folds'] = int(len(fold_results))
+                    print(f"  {mt} (CV): folds={len(fold_results)}, avg_val_auc={avg_val_auc:.4f}, avg_test_auc={results[f'{mt}_test_auc']:.4f}, time={results[f'{mt}_time']:.1f}s")
+                else:
+                    n = len(X)
+                    train_end = int(n * 0.7)
+                    val_end = int(n * 0.85)
+                    X_train, y_train = X[:train_end], y[:train_end]
+                    X_val, y_val = X[train_end:val_end], y[train_end:val_end]
+                    X_test, y_test = X[val_end:], y[val_end:]
+                    print(f"  Split: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
+                    print(f"  Label dist: up={y_test.mean()*100:.1f}%")
 
-                results[f'{mt}_val_auc'] = metrics.get('val_auc', 0)
-                results[f'{mt}_test_auc'] = test_auc
-                results[f'{mt}_test_acc'] = test_acc
-                results[f'{mt}_time'] = round(elapsed, 1)
-                print(f"  {mt}: val_auc={metrics.get('val_auc', 0):.4f}, test_auc={test_auc:.4f}, time={elapsed:.1f}s")
+                    model, metrics = trainer.train_model(mt, X_train, y_train, X_val, y_val)
+                    test_probs = model.predict_proba(X_test)
+                    test_auc = roc_auc_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.5
+                    test_acc = accuracy_score(y_test, (test_probs >= 0.5).astype(int))
+                    elapsed = time.time() - t0
+
+                    results[f'{mt}_val_auc'] = metrics.get('val_auc', 0)
+                    results[f'{mt}_test_auc'] = float(test_auc)
+                    results[f'{mt}_test_acc'] = float(test_acc)
+                    results[f'{mt}_time'] = round(elapsed, 1)
+                    print(f"  {mt}: val_auc={metrics.get('val_auc', 0):.4f}, test_auc={test_auc:.4f}, time={elapsed:.1f}s")
             except Exception as e:
                 print(f"  {mt} FAILED: {e}")
                 results[f'{mt}_val_auc'] = 0
@@ -602,7 +664,7 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         X_rows = np.nan_to_num(X_rows, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
         n_rows = len(X_rows)
-        n_samples = n_rows - int(seq_length)  # sample start s in [0, n_samples)
+        n_samples = n_rows - int(seq_length) + (1 if align == "current" else 0)  # sample start s in [0, n_samples)
         if n_samples < 500:
             print(f"  Insufficient sequence samples ({n_samples}), skipping")
             return None
@@ -618,14 +680,15 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         X_rows = np.clip(X_rows, -5, 5)
 
         bs = int(batch_size) if batch_size else int(TRAINING_CONFIG["batch_size"])
-        train_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=0, end=train_end_s)
-        val_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=train_end_s, end=val_end_s)
-        test_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=val_end_s, end=n_samples)
+        train_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=0, end=train_end_s, align=align)
+        val_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=train_end_s, end=val_end_s, align=align)
+        test_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=val_end_s, end=n_samples, align=align)
         train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, drop_last=True)
         val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, drop_last=False)
         test_loader = DataLoader(test_ds, batch_size=bs, shuffle=False, drop_last=False)
 
-        y_test_samples = y_rows[int(seq_length) + val_end_s:int(seq_length) + n_samples]
+        label_offset = int(seq_length) if align == "next" else int(seq_length) - 1
+        y_test_samples = y_rows[label_offset + val_end_s:label_offset + n_samples]
         print(f"  Split(samples): train={train_end_s}, val={val_end_s-train_end_s}, test={n_samples-val_end_s}")
         print(f"  Label dist(test): up={y_test_samples.mean()*100:.1f}%")
 
@@ -640,7 +703,7 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         for mt in model_types:
             t0 = time.time()
             try:
-                y_train_samples = y_rows[int(seq_length):int(seq_length) + train_end_s]
+                y_train_samples = y_rows[label_offset:label_offset + train_end_s]
                 model, metrics = _train_deep_with_loaders(
                     trainer,
                     model_type=mt,
@@ -667,7 +730,7 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         return results
 
     # ============ 3) 深度模型（构造完整 3D 序列，耗内存） ============
-    X, y = create_sequences(df_feat, used_cols, seq_length)
+    X, y = create_sequences(df_feat, used_cols, seq_length, align=align)
     n = len(X)
     train_end = int(n * 0.7)
     val_end = int(n * 0.85)
@@ -746,6 +809,8 @@ def main():
                         help='tabular 缩放方式（用于 --tabular）：robust / none')
     parser.add_argument('--tabular-clip', type=float, default=5.0,
                         help='tabular 缩放后裁剪阈值；设为 0 表示不裁剪（用于 --tabular）')
+    parser.add_argument('--align', default='next', choices=['next', 'current'],
+                        help='样本对齐口径：next=用到t-1预测t；current=用到t预测t（更常见的bar-close口径）')
     parser.add_argument('--rolling-dataset', action='store_true',
                         help='深度模型使用滚动窗口 Dataset 动态取样（显著降低内存峰值；推荐 transformer/lstm 在大样本上用）')
     parser.add_argument('--no-select', action='store_true', help='关闭特征选择，直接使用全部候选特征')
@@ -757,6 +822,12 @@ def main():
                         help='对选择后的特征做共线性剪枝（训练段计算 abs(corr)；例如 0.98）')
     parser.add_argument('--corr-method', default='pearson', choices=['pearson', 'spearman'],
                         help='相关系数方法（用于 --prune-corr）')
+    parser.add_argument('--cv', action='store_true',
+                        help='使用 expanding window CV 评估（更稳，避免单次切分偶然性）')
+    parser.add_argument('--cv-splits', type=int, default=None, help='CV 折数（默认用 config.settings）')
+    parser.add_argument('--cv-gap', type=int, default=None, help='CV gap（默认用 config.settings）')
+    parser.add_argument('--cv-val-ratio', type=float, default=None, help='CV 验证集比例（默认用 config.settings）')
+    parser.add_argument('--cv-test-ratio', type=float, default=None, help='CV 测试集比例（默认用 config.settings）')
     parser.add_argument('--label-mode', default='binary', choices=['binary', 'triple_barrier'],
                         help='Labeling method: binary or triple_barrier (AFML)')
     parser.add_argument('--pt-sl', default='1.0,1.0',
@@ -835,6 +906,12 @@ def main():
             tabular_agg=str(args.tabular_agg),
             tabular_scale=str(args.tabular_scale),
             tabular_clip=(None if float(args.tabular_clip) <= 0 else float(args.tabular_clip)),
+            align=str(args.align),
+            cv=bool(args.cv),
+            cv_splits=args.cv_splits,
+            cv_gap=args.cv_gap,
+            cv_val_ratio=args.cv_val_ratio,
+            cv_test_ratio=args.cv_test_ratio,
         )
         if result:
             all_results.append(result)
