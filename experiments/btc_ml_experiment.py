@@ -1195,14 +1195,70 @@ def _select_features_if_needed(
     no_select: bool,
     select_method: str,
     max_features: int,
+    always_include_prefix: str | None = None,
+    always_include_cols: str | None = None,
 ) -> list[str]:
+    def _parse_list(s: str | None) -> list[str]:
+        if s is None:
+            return []
+        s = str(s).strip()
+        if not s:
+            return []
+        return [x.strip() for x in s.split(",") if x.strip()]
+
+    prefixes = _parse_list(always_include_prefix)
+    forced_cols = set(_parse_list(always_include_cols))
+
+    # 先决定“基础选择集”
     if no_select:
-        return feature_cols
-    fe = FeatureEngineer()
-    fe.feature_names = feature_cols
-    train_end = int(len(df_feat) * 0.7)
-    selected = fe.select_features(df_feat, method=select_method, max_features=int(max_features), train_end_idx=train_end)
-    return selected
+        selected = list(feature_cols)
+    else:
+        fe = FeatureEngineer()
+        fe.feature_names = feature_cols
+        train_end = int(len(df_feat) * 0.7)
+        selected = fe.select_features(df_feat, method=select_method, max_features=int(max_features), train_end_idx=train_end)
+
+    if not prefixes and not forced_cols:
+        return selected
+
+    # 计算需要强制保留的列（基于完整候选列 feature_cols 匹配，避免被特征选择剔除）
+    forced: list[str] = []
+    forced_set: set[str] = set()
+    # 1) 精确列名
+    for c in feature_cols:
+        if c in forced_cols and c not in forced_set:
+            forced.append(c)
+            forced_set.add(c)
+    # 2) 前缀匹配
+    if prefixes:
+        for c in feature_cols:
+            if c in forced_set:
+                continue
+            if any(c.startswith(p) for p in prefixes):
+                forced.append(c)
+                forced_set.add(c)
+
+    if not forced:
+        return selected
+
+    # 强制列优先，其余按 selected 的重要性顺序补齐
+    merged = forced + [c for c in selected if c not in forced_set]
+    if not no_select:
+        if len(merged) > int(max_features):
+            # 若 forced 过多，会挤占 topN；这是预期行为，但给出提示
+            print(f"  强制保留: {len(forced)} 个特征（prefix={prefixes}, cols={len(forced_cols)}），最终将从 {len(merged)} 截断到 max_features={int(max_features)}")
+        merged = merged[: int(max_features)]
+        # 兜底：极端情况下 forced>max_features，截断可能丢 forced，给出提示
+        if len(forced) > int(max_features):
+            print(f"  警告：强制保留特征数({len(forced)}) > max_features({int(max_features)})，部分强制特征会被截断丢弃。建议调大 --max-features。")
+    else:
+        print(f"  强制保留: {len(forced)} 个特征（prefix={prefixes}, cols={len(forced_cols)}），--no-select 下不受 max_features 限制")
+
+    # 简要展示
+    preview = ", ".join(forced[:6])
+    if preview:
+        print(f"  强制保留示例: {preview}" + (" ..." if len(forced) > 6 else ""))
+    return merged
 
 
 def _prune_correlated_features(
@@ -1310,6 +1366,8 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    alpha101_list: str | None = None,
                    alpha101_rank_window: int = 20,
                    alpha101_adv_window: int = 20,
+                   always_include_prefix: str | None = None,
+                   always_include_cols: str | None = None,
                    no_select: bool = False,
                    select_method: str = "mutual_info",
                    max_features: int = MAX_FEATURES,
@@ -1386,6 +1444,8 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         no_select=bool(no_select),
         select_method=str(select_method),
         max_features=int(max_features),
+        always_include_prefix=always_include_prefix,
+        always_include_cols=always_include_cols,
     )
     if prune_corr is not None:
         before = len(used_cols)
@@ -1901,6 +1961,10 @@ def main():
                         help='Alpha101 中 rank/scale 的时间序列近似窗口（默认20）')
     parser.add_argument('--alpha101-adv-window', type=int, default=20,
                         help='Alpha101 中 adv 的窗口（默认20）')
+    parser.add_argument('--always-include-prefix', type=str, default=None,
+                        help='强制保留特征名前缀（逗号分隔），不受特征选择丢弃影响。例如: state_,alpha101_')
+    parser.add_argument('--always-include-cols', type=str, default=None,
+                        help='强制保留的特征列名（逗号分隔），不受特征选择丢弃影响')
     parser.add_argument('--no-select', action='store_true', help='关闭特征选择，直接使用全部候选特征')
     parser.add_argument('--select-method', default='mutual_info', choices=['mutual_info', 'f_classif', 'random_forest'],
                         help='特征选择方法')
@@ -2044,6 +2108,8 @@ def main():
             alpha101_list=args.alpha101_list,
             alpha101_rank_window=int(args.alpha101_rank_window),
             alpha101_adv_window=int(args.alpha101_adv_window),
+            always_include_prefix=args.always_include_prefix,
+            always_include_cols=args.always_include_cols,
             no_select=bool(args.no_select),
             select_method=str(args.select_method),
             max_features=int(args.max_features),
