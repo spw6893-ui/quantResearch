@@ -23,6 +23,7 @@ from experiments.btc_data import (
 )
 from experiments.btc_signal_scan import add_ta_indicators
 from config.settings import LGBM_CONFIG, XGB_CONFIG, MAX_FEATURES, RANDOM_SEED, TRAINING_CONFIG
+from config.settings import CV_CONFIG
 from data.feature_engineering import FeatureEngineer
 from models.lgbm_model import LGBMModel
 from models.xgb_model import XGBModel
@@ -594,6 +595,16 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         print(f"  Insufficient data ({len(df_feat)} rows), skipping")
         return None
 
+    # 重要提示：label 用的是未来 horizon 的收益（shift(-horizon)），如果 split/cv_gap 太小，
+    # 训练集靠近边界的样本 label 会引用到验证/测试区间的价格，产生“轻微前视泄露”。
+    # 更严格的做法是 purge+embargo（gap >= horizon）。这里先给出提醒，不强制改默认行为。
+    eff_split_gap = int(split_gap) if split_gap is not None else 0
+    eff_cv_gap = int(cv_gap) if cv_gap is not None else int(CV_CONFIG.get("gap", 0))
+    if eff_split_gap < int(horizon) and not cv:
+        print(f"  警告：--split-gap={eff_split_gap} < horizon={horizon}，边界附近样本可能存在未来信息泄露。建议设为 >= {horizon}。")
+    if cv and eff_cv_gap < int(horizon):
+        print(f"  警告：--cv-gap={eff_cv_gap} < horizon={horizon}，CV 边界附近样本可能存在未来信息泄露。建议设为 >= {horizon}。")
+
     used_cols = _select_features_if_needed(
         df_feat, feature_cols,
         no_select=bool(no_select),
@@ -669,12 +680,16 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                         fit_params=fit_params,
                     )
                     fold_results = cv_out.get("fold_results", [])
+                    fold_val_aucs = [float(r.get("val_auc", 0.0)) for r in fold_results]
+                    fold_test_aucs = [float(r.get("test_auc", 0.0)) for r in fold_results]
                     avg_val_auc = float(np.mean([r.get("val_auc", 0.0) for r in fold_results])) if fold_results else 0.0
                     results[f'{mt}_val_auc'] = avg_val_auc
                     results[f'{mt}_test_auc'] = float(cv_out.get("avg_test_auc", 0.0))
                     results[f'{mt}_test_acc'] = float(cv_out.get("avg_test_acc", 0.0))
                     results[f'{mt}_time'] = round(time.time() - t0, 1)
                     results[f'{mt}_cv_folds'] = int(len(fold_results))
+                    results[f'{mt}_val_auc_std'] = float(np.std(fold_val_aucs)) if fold_val_aucs else 0.0
+                    results[f'{mt}_test_auc_std'] = float(np.std(fold_test_aucs)) if fold_test_aucs else 0.0
                     print(f"  {mt} (CV): folds={len(fold_results)}, avg_val_auc={avg_val_auc:.4f}, avg_test_auc={results[f'{mt}_test_auc']:.4f}, time={results[f'{mt}_time']:.1f}s")
                 else:
                     n = len(X)
