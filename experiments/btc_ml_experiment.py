@@ -180,12 +180,16 @@ def _seq_to_tabular_rolling(
 
     out = np.empty((n_samples, n_feat * mult), dtype=np.float32)
 
+    # NaN-aware：忽略缺失值，避免把缺失当 0（XGBoost/LightGBM 可原生处理 NaN）
     win_sum = np.zeros((n_feat,), dtype=np.float64)
     win_sum2 = np.zeros((n_feat,), dtype=np.float64)
-    init = X[:seq_length].astype(np.float64)
-    win_sum[:] = np.sum(init, axis=0)
-    win_sum2[:] = np.sum(init ** 2, axis=0)
-    inv = 1.0 / float(seq_length)
+    win_cnt = np.zeros((n_feat,), dtype=np.float64)
+    init = X[:seq_length]
+    m_init = np.isfinite(init)
+    init0 = np.where(m_init, init, 0.0).astype(np.float64)
+    win_sum[:] = np.sum(init0, axis=0)
+    win_sum2[:] = np.sum(init0 ** 2, axis=0)
+    win_cnt[:] = np.sum(m_init, axis=0).astype(np.float64)
 
     for s in range(n_samples):
         end_row = s + seq_length - 1
@@ -194,22 +198,40 @@ def _seq_to_tabular_rolling(
         if agg == "last":
             out[s, 0:n_feat] = last
         elif agg == "last_mean":
-            mean = (win_sum * inv).astype(np.float32)
+            mean64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            valid = win_cnt > 0
+            mean64[valid] = win_sum[valid] / win_cnt[valid]
+            mean = mean64.astype(np.float32)
             out[s, 0:n_feat] = last
             out[s, n_feat:2 * n_feat] = mean
         else:
-            mean64 = win_sum * inv
-            var64 = win_sum2 * inv - mean64 ** 2
+            mean64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            var64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            valid = win_cnt > 0
+            mean64[valid] = win_sum[valid] / win_cnt[valid]
+            var64[valid] = win_sum2[valid] / win_cnt[valid] - mean64[valid] ** 2
             var64 = np.maximum(var64, 0.0)
             out[s, 0:n_feat] = last
             out[s, n_feat:2 * n_feat] = mean64.astype(np.float32)
             out[s, 2 * n_feat:3 * n_feat] = np.sqrt(var64).astype(np.float32)
 
         if s + 1 < n_samples:
-            leaving = X[s].astype(np.float64)
-            entering = X[s + seq_length].astype(np.float64)
-            win_sum += entering - leaving
-            win_sum2 += entering ** 2 - leaving ** 2
+            leaving = X[s]
+            entering = X[s + seq_length]
+
+            m_leave = np.isfinite(leaving)
+            m_enter = np.isfinite(entering)
+
+            if m_leave.any():
+                lv = leaving[m_leave].astype(np.float64)
+                win_sum[m_leave] -= lv
+                win_sum2[m_leave] -= lv ** 2
+                win_cnt[m_leave] -= 1.0
+            if m_enter.any():
+                ev = entering[m_enter].astype(np.float64)
+                win_sum[m_enter] += ev
+                win_sum2[m_enter] += ev ** 2
+                win_cnt[m_enter] += 1.0
 
     return out
 
@@ -299,9 +321,10 @@ def create_tabular(
 
     重要：对齐口径与深度模型一致（用过去 seq_length 预测下一根的 label）。
     """
-    X_rows = df[feature_cols].values
+    X_rows = df[feature_cols].values.astype(np.float32, copy=False)
     y_rows = df["label"].values.astype(np.int64)
-    X_rows = np.nan_to_num(X_rows, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    # 先把 inf 规范成 NaN（方便后续 missing 逻辑统一处理）
+    X_rows = np.where(np.isfinite(X_rows), X_rows, np.nan).astype(np.float32, copy=False)
 
     n_rows = len(X_rows)
     seq_length = int(seq_length)
@@ -318,6 +341,8 @@ def create_tabular(
         raise ValueError("tabular_scale 仅支持: robust / none")
 
     if tabular_scale == "robust":
+        # RobustScaler 不支持 NaN：这里用 0 填充缺失值（也可未来扩展 median/ffill）
+        X_rows = np.nan_to_num(X_rows, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
         scaler = RobustScaler()
         scaler.fit(X_rows[:fit_end_row + 1])
         X_rows = scaler.transform(X_rows).astype(np.float32)
