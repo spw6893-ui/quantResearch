@@ -614,24 +614,22 @@ def _regime_cv_separate_train(
             per_r[r]["test_n"].append(int(len(te)))
 
     out = {"regimes": regimes, "per_regime": {}}
-    # 以各regime在各fold的 test 样本数为权重做加权平均（比简单平均更贴近整体表现）
+    # 用每个 fold 的 test_n 做全局加权：sum(auc * n) / sum(n)
     total_n = 0
-    weighted_auc = 0.0
-    weighted_acc = 0.0
+    weighted_auc_sum = 0.0
+    weighted_acc_sum = 0.0
     for r in regimes:
         ns = per_r[r]["test_n"]
         aucs = per_r[r]["test_auc"]
         accs = per_r[r]["test_acc"]
         n_sum = int(np.sum(ns)) if ns else 0
-        if n_sum > 0 and aucs:
-            # 先按 fold 内的 test_n 做加权，再汇总
+        if n_sum > 0 and aucs and accs:
             w = np.asarray(ns, dtype=np.float64)
-            w = w / max(float(np.sum(w)), 1.0)
-            r_auc = float(np.sum(w * np.asarray(aucs, dtype=np.float64)))
-            r_acc = float(np.sum(w * np.asarray(accs, dtype=np.float64)))
-            weighted_auc += r_auc * n_sum
-            weighted_acc += r_acc * n_sum
-            total_n += n_sum
+            auc_arr = np.asarray(aucs, dtype=np.float64)
+            acc_arr = np.asarray(accs, dtype=np.float64)
+            weighted_auc_sum += float(np.sum(w * auc_arr))
+            weighted_acc_sum += float(np.sum(w * acc_arr))
+            total_n += int(np.sum(w))
 
         out["per_regime"][f"r{r}"] = {
             "folds_used": int(len(aucs)),
@@ -643,8 +641,8 @@ def _regime_cv_separate_train(
             "test_acc_mean": float(np.mean(accs)) if accs else 0.0,
         }
 
-    out["weighted_test_auc"] = float(weighted_auc / max(total_n, 1))
-    out["weighted_test_acc"] = float(weighted_acc / max(total_n, 1))
+    out["weighted_test_auc"] = float(weighted_auc_sum / max(total_n, 1))
+    out["weighted_test_acc"] = float(weighted_acc_sum / max(total_n, 1))
     out["total_test_n"] = int(total_n)
     return out
 
