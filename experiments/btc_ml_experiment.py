@@ -1109,7 +1109,12 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                             results[f"{mt}_{k}_coverage"] = float(v.get("coverage", 0.0))
                             results[f"{mt}_{k}_test_n"] = int(v.get("test_n", 0))
                             results[f"{mt}_{k}_folds"] = int(v.get("folds_used", 0))
-                            print(f"    {k}: test_auc={v.get('test_auc_mean',0.0):.4f}±{v.get('test_auc_std',0.0):.4f}, cov={v.get('coverage',0.0)*100:.1f}%, test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}")
+                            results[f"{mt}_{k}_test_up_ratio"] = float(v.get("test_up_ratio", 0.0))
+                            print(
+                                f"    {k}: test_auc={v.get('test_auc_mean',0.0):.4f}±{v.get('test_auc_std',0.0):.4f}, "
+                                f"cov={v.get('coverage',0.0)*100:.1f}%, up={v.get('test_up_ratio',0.0)*100:.1f}%, "
+                                f"test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}"
+                            )
                     else:
                         cv_out = trainer.cross_validate(
                             mt, X, y,
