@@ -8,6 +8,7 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 from sklearn.preprocessing import RobustScaler
 import torch
 from torch.utils.data import Dataset, DataLoader
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -166,6 +167,7 @@ def _seq_to_tabular_rolling(
       - last
       - last_mean
       - last_mean_std
+      - last_mean_std_slope
     """
     X = np.asarray(X_rows, dtype=np.float32)
     n_rows, n_feat = X.shape
@@ -178,9 +180,9 @@ def _seq_to_tabular_rolling(
         raise ValueError("seq_length 太大，无法生成样本")
 
     agg = (agg or "last_mean_std").strip().lower()
-    if agg not in ("last", "last_mean", "last_mean_std"):
-        raise ValueError("tabular_agg 仅支持: last / last_mean / last_mean_std")
-    mult = {"last": 1, "last_mean": 2, "last_mean_std": 3}[agg]
+    if agg not in ("last", "last_mean", "last_mean_std", "last_mean_std_slope"):
+        raise ValueError("tabular_agg 仅支持: last / last_mean / last_mean_std / last_mean_std_slope")
+    mult = {"last": 1, "last_mean": 2, "last_mean_std": 3, "last_mean_std_slope": 4}[agg]
 
     out = np.empty((n_samples, n_feat * mult), dtype=np.float32)
 
@@ -198,6 +200,7 @@ def _seq_to_tabular_rolling(
     for s in range(n_samples):
         end_row = s + seq_length - 1  # align=next/current 都是 window 的最后一行
         last = X[end_row]
+        first = X[s]
 
         if agg == "last":
             out[s, 0:n_feat] = last
@@ -208,6 +211,16 @@ def _seq_to_tabular_rolling(
             mean = mean64.astype(np.float32)
             out[s, 0:n_feat] = last
             out[s, n_feat:2 * n_feat] = mean
+        elif agg == "last_mean_std":
+            mean64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            var64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            valid = win_cnt > 0
+            mean64[valid] = win_sum[valid] / win_cnt[valid]
+            var64[valid] = win_sum2[valid] / win_cnt[valid] - mean64[valid] ** 2
+            var64 = np.maximum(var64, 0.0)
+            out[s, 0:n_feat] = last
+            out[s, n_feat:2 * n_feat] = mean64.astype(np.float32)
+            out[s, 2 * n_feat:3 * n_feat] = np.sqrt(var64).astype(np.float32)
         else:
             mean64 = np.full((n_feat,), np.nan, dtype=np.float64)
             var64 = np.full((n_feat,), np.nan, dtype=np.float64)
@@ -218,6 +231,7 @@ def _seq_to_tabular_rolling(
             out[s, 0:n_feat] = last
             out[s, n_feat:2 * n_feat] = mean64.astype(np.float32)
             out[s, 2 * n_feat:3 * n_feat] = np.sqrt(var64).astype(np.float32)
+            out[s, 3 * n_feat:4 * n_feat] = (last - first).astype(np.float32)
 
         if s + 1 < n_samples:
             leaving = X[s]
@@ -379,6 +393,23 @@ def create_tabular(
     X_tab = _seq_to_tabular_rolling(X_rows, seq_length=seq_length, agg=tabular_agg, align=align)
     y = y_rows[seq_length:] if align == "next" else y_rows[seq_length - 1:]
     return X_tab, y
+
+
+def _parse_json_dict(s: str | None, arg_name: str) -> dict | None:
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    try:
+        obj = json.loads(s)
+    except Exception as e:
+        raise ValueError(f"{arg_name} 解析失败，请提供 JSON 对象字符串。例如: '{{\"max_depth\":4,\"min_child_weight\":10}}'。原错误: {e}") from e
+    if obj is None:
+        return None
+    if not isinstance(obj, dict):
+        raise ValueError(f"{arg_name} 需要是 JSON 对象(dict)，而不是 {type(obj)}")
+    return obj
 
 
 class RollingWindowDataset(Dataset):
@@ -547,6 +578,11 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    tabular_scale: str = "robust",
                    tabular_clip: float | None = 5.0,
                    align: str = "next",
+                   xgb_params: dict | None = None,
+                   lgbm_params: dict | None = None,
+                   xgb_fit_params: dict | None = None,
+                   lgbm_fit_params: dict | None = None,
+                   split_gap: int = 0,
                    cv: bool = False,
                    cv_splits: int | None = None,
                    cv_gap: int | None = None,
@@ -597,6 +633,7 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
             tabular_clip=tabular_clip,
             align=align,
         )
+        gap = int(split_gap) if split_gap is not None else 0
         results = {
             'horizon': horizon,
             'n_features': len(used_cols),
@@ -608,6 +645,15 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         for mt in model_types:
             t0 = time.time()
             try:
+                model_params = None
+                fit_params = None
+                if mt == "xgboost":
+                    model_params = xgb_params
+                    fit_params = xgb_fit_params
+                elif mt == "lgbm":
+                    model_params = lgbm_params
+                    fit_params = lgbm_fit_params
+
                 if cv:
                     cfg = {
                         "n_splits": int(cv_splits) if cv_splits is not None else None,
@@ -616,7 +662,12 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                         "test_ratio": float(cv_test_ratio) if cv_test_ratio is not None else None,
                     }
                     cv_cfg = {k: v for k, v in cfg.items() if v is not None}
-                    cv_out = trainer.cross_validate(mt, X, y, cv_config=cv_cfg if cv_cfg else None)
+                    cv_out = trainer.cross_validate(
+                        mt, X, y,
+                        cv_config=cv_cfg if cv_cfg else None,
+                        model_params=model_params,
+                        fit_params=fit_params,
+                    )
                     fold_results = cv_out.get("fold_results", [])
                     avg_val_auc = float(np.mean([r.get("val_auc", 0.0) for r in fold_results])) if fold_results else 0.0
                     results[f'{mt}_val_auc'] = avg_val_auc
@@ -628,14 +679,23 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                 else:
                     n = len(X)
                     train_end = int(n * 0.7)
-                    val_end = int(n * 0.85)
+                    val_size = int(n * 0.15)
+                    val_start = train_end + gap
+                    val_end = val_start + val_size
+                    test_start = val_end + gap
+                    if val_end >= n or test_start >= n:
+                        raise ValueError(f"split_gap={gap} 过大，导致 val/test 为空（n={n}）。请减小 --split-gap。")
                     X_train, y_train = X[:train_end], y[:train_end]
-                    X_val, y_val = X[train_end:val_end], y[train_end:val_end]
-                    X_test, y_test = X[val_end:], y[val_end:]
+                    X_val, y_val = X[val_start:val_end], y[val_start:val_end]
+                    X_test, y_test = X[test_start:], y[test_start:]
                     print(f"  Split: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
                     print(f"  Label dist: up={y_test.mean()*100:.1f}%")
 
-                    model, metrics = trainer.train_model(mt, X_train, y_train, X_val, y_val)
+                    model, metrics = trainer.train_model(
+                        mt, X_train, y_train, X_val, y_val,
+                        model_params=model_params,
+                        fit_params=fit_params,
+                    )
                     test_probs = model.predict_proba(X_test)
                     test_auc = roc_auc_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.5
                     test_acc = accuracy_score(y_test, (test_probs >= 0.5).astype(int))
@@ -652,6 +712,9 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                 results[f'{mt}_test_auc'] = 0
                 results[f'{mt}_test_acc'] = 0
                 results[f'{mt}_time'] = 0
+        results["n_train"] = int(len(X_train)) if "X_train" in locals() else results["n_train"]
+        results["n_test"] = int(len(X_test)) if "X_test" in locals() else results["n_test"]
+        results["test_up_ratio"] = float(np.mean(y_test)) if "y_test" in locals() and len(y_test) else results["test_up_ratio"]
         return results
 
     # ============ 2) 深度模型滚动 Dataset（省内存） ============
@@ -669,8 +732,14 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
             print(f"  Insufficient sequence samples ({n_samples}), skipping")
             return None
 
+        gap = int(split_gap) if split_gap is not None else 0
         train_end_s = int(n_samples * 0.7)
-        val_end_s = int(n_samples * 0.85)
+        val_size_s = int(n_samples * 0.15)
+        val_start_s = train_end_s + gap
+        val_end_s = val_start_s + val_size_s
+        test_start_s = val_end_s + gap
+        if val_end_s >= n_samples or test_start_s >= n_samples:
+            raise ValueError(f"split_gap={gap} 过大，导致 val/test 为空（n_samples={n_samples}）。请减小 --split-gap。")
 
         # scaler fit 到训练样本覆盖到的最后一行，避免泄露
         fit_end_row = max(train_end_s + int(seq_length) - 2, 0)
@@ -681,22 +750,22 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
 
         bs = int(batch_size) if batch_size else int(TRAINING_CONFIG["batch_size"])
         train_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=0, end=train_end_s, align=align)
-        val_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=train_end_s, end=val_end_s, align=align)
-        test_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=val_end_s, end=n_samples, align=align)
+        val_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=val_start_s, end=val_end_s, align=align)
+        test_ds = RollingWindowDataset(X_rows, y_rows, seq_length=int(seq_length), start=test_start_s, end=n_samples, align=align)
         train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, drop_last=True)
         val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, drop_last=False)
         test_loader = DataLoader(test_ds, batch_size=bs, shuffle=False, drop_last=False)
 
         label_offset = int(seq_length) if align == "next" else int(seq_length) - 1
-        y_test_samples = y_rows[label_offset + val_end_s:label_offset + n_samples]
-        print(f"  Split(samples): train={train_end_s}, val={val_end_s-train_end_s}, test={n_samples-val_end_s}")
+        y_test_samples = y_rows[label_offset + test_start_s:label_offset + n_samples]
+        print(f"  Split(samples): train={train_end_s}, val={val_end_s-val_start_s}, test={n_samples-test_start_s}")
         print(f"  Label dist(test): up={y_test_samples.mean()*100:.1f}%")
 
         results = {
             'horizon': horizon,
             'n_features': len(used_cols),
             'n_train': int(train_end_s),
-            'n_test': int(n_samples - val_end_s),
+            'n_test': int(n_samples - test_start_s),
             'test_up_ratio': float(y_test_samples.mean()) if len(y_test_samples) else 0.0,
         }
 
@@ -732,11 +801,17 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
     # ============ 3) 深度模型（构造完整 3D 序列，耗内存） ============
     X, y = create_sequences(df_feat, used_cols, seq_length, align=align)
     n = len(X)
+    gap = int(split_gap) if split_gap is not None else 0
     train_end = int(n * 0.7)
-    val_end = int(n * 0.85)
+    val_size = int(n * 0.15)
+    val_start = train_end + gap
+    val_end = val_start + val_size
+    test_start = val_end + gap
+    if val_end >= n or test_start >= n:
+        raise ValueError(f"split_gap={gap} 过大，导致 val/test 为空（n={n}）。请减小 --split-gap。")
     X_train, y_train = X[:train_end], y[:train_end]
-    X_val, y_val = X[train_end:val_end], y[train_end:val_end]
-    X_test, y_test = X[val_end:], y[val_end:]
+    X_val, y_val = X[val_start:val_end], y[val_start:val_end]
+    X_test, y_test = X[test_start:], y[test_start:]
 
     print(f"  Split: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
     print(f"  Label dist: up={y_test.mean()*100:.1f}%")
@@ -803,14 +878,16 @@ def main():
     parser.add_argument('--seq-length', type=int, default=60)
     parser.add_argument('--tabular', action='store_true',
                         help='对 lgbm/xgboost 使用 tabular(last/mean/std) 表示，避免构造 3D 大矩阵（更省内存）')
-    parser.add_argument('--tabular-agg', default='last_mean_std', choices=['last', 'last_mean', 'last_mean_std'],
-                        help='tabular 聚合方式（用于 --tabular）：last / last_mean / last_mean_std')
+    parser.add_argument('--tabular-agg', default='last_mean_std', choices=['last', 'last_mean', 'last_mean_std', 'last_mean_std_slope'],
+                        help='tabular 聚合方式（用于 --tabular）：last / last_mean / last_mean_std / last_mean_std_slope')
     parser.add_argument('--tabular-scale', default='robust', choices=['robust', 'none'],
                         help='tabular 缩放方式（用于 --tabular）：robust / none')
     parser.add_argument('--tabular-clip', type=float, default=5.0,
                         help='tabular 缩放后裁剪阈值；设为 0 表示不裁剪（用于 --tabular）')
     parser.add_argument('--align', default='next', choices=['next', 'current'],
                         help='样本对齐口径：next=用到t-1预测t；current=用到t预测t（更常见的bar-close口径）')
+    parser.add_argument('--split-gap', type=int, default=0,
+                        help='train/val/test 之间的样本间隔（embargo，防止相邻窗口强相关）。默认0；建议与 --cv-gap 同量级（例如10）。')
     parser.add_argument('--rolling-dataset', action='store_true',
                         help='深度模型使用滚动窗口 Dataset 动态取样（显著降低内存峰值；推荐 transformer/lstm 在大样本上用）')
     parser.add_argument('--no-select', action='store_true', help='关闭特征选择，直接使用全部候选特征')
@@ -822,6 +899,14 @@ def main():
                         help='对选择后的特征做共线性剪枝（训练段计算 abs(corr)；例如 0.98）')
     parser.add_argument('--corr-method', default='pearson', choices=['pearson', 'spearman'],
                         help='相关系数方法（用于 --prune-corr）')
+    parser.add_argument('--xgb-params', type=str, default=None,
+                        help='覆盖/追加 XGBoost 参数（JSON dict）。例如: \'{"max_depth":4,"min_child_weight":10,"subsample":0.8,"colsample_bytree":0.8,"reg_lambda":3}\'')
+    parser.add_argument('--xgb-num-boost-round', type=int, default=None, help='覆盖 XGBoost num_boost_round')
+    parser.add_argument('--xgb-early-stopping-rounds', type=int, default=None, help='覆盖 XGBoost early_stopping_rounds')
+    parser.add_argument('--lgbm-params', type=str, default=None,
+                        help='覆盖/追加 LightGBM 参数（JSON dict）。例如: \'{"num_leaves":31,"min_child_samples":50}\'')
+    parser.add_argument('--lgbm-num-boost-round', type=int, default=None, help='覆盖 LightGBM num_boost_round')
+    parser.add_argument('--lgbm-early-stopping-rounds', type=int, default=None, help='覆盖 LightGBM early_stopping_rounds')
     parser.add_argument('--cv', action='store_true',
                         help='使用 expanding window CV 评估（更稳，避免单次切分偶然性）')
     parser.add_argument('--cv-splits', type=int, default=None, help='CV 折数（默认用 config.settings）')
@@ -884,6 +969,24 @@ def main():
     if args.label_mode == 'triple_barrier':
         print(f'Label mode: Triple Barrier (pt={pt_sl_vals[0]}, sl={pt_sl_vals[1]})')
 
+    xgb_params = _parse_json_dict(args.xgb_params, "--xgb-params")
+    lgbm_params = _parse_json_dict(args.lgbm_params, "--lgbm-params")
+    xgb_fit_params = {}
+    if args.xgb_num_boost_round is not None:
+        xgb_fit_params["num_boost_round"] = int(args.xgb_num_boost_round)
+    if args.xgb_early_stopping_rounds is not None:
+        xgb_fit_params["early_stopping_rounds"] = int(args.xgb_early_stopping_rounds)
+    if not xgb_fit_params:
+        xgb_fit_params = None
+
+    lgbm_fit_params = {}
+    if args.lgbm_num_boost_round is not None:
+        lgbm_fit_params["num_boost_round"] = int(args.lgbm_num_boost_round)
+    if args.lgbm_early_stopping_rounds is not None:
+        lgbm_fit_params["early_stopping_rounds"] = int(args.lgbm_early_stopping_rounds)
+    if not lgbm_fit_params:
+        lgbm_fit_params = None
+
     all_results = []
     for h in horizons:
         print(f'\n{"="*70}')
@@ -907,6 +1010,11 @@ def main():
             tabular_scale=str(args.tabular_scale),
             tabular_clip=(None if float(args.tabular_clip) <= 0 else float(args.tabular_clip)),
             align=str(args.align),
+            xgb_params=xgb_params,
+            lgbm_params=lgbm_params,
+            xgb_fit_params=xgb_fit_params,
+            lgbm_fit_params=lgbm_fit_params,
+            split_gap=int(args.split_gap),
             cv=bool(args.cv),
             cv_splits=args.cv_splits,
             cv_gap=args.cv_gap,

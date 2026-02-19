@@ -250,12 +250,23 @@ class ModelTrainer:
         acc = accuracy_score(all_labels, (np.array(all_preds) >= 0.5).astype(int))
         return avg_loss, auc, acc, np.array(all_preds), np.array(all_labels)
 
-    def _train_lgbm(self, X_train, y_train, X_val, y_val, config=None):
+    def _train_lgbm(self, X_train, y_train, X_val, y_val, config=None, model_params: dict | None = None, fit_params: dict | None = None):
         """训练LightGBM模型"""
-        model = LGBMModel(**LGBM_CONFIG)
-        model.fit(X_train, y_train, X_val, y_val,
-                 num_boost_round=config.get('max_epochs', 100) * 10 if config else 1000,
-                 early_stopping_rounds=50)
+        if fit_params is None:
+            fit_params = {}
+        params = {**LGBM_CONFIG, **(model_params or {})}
+        model = LGBMModel(**params)
+
+        default_num_boost_round = config.get('max_epochs', 100) * 10 if config else 1000
+        num_boost_round = int(fit_params.get("num_boost_round", default_num_boost_round))
+        early_stopping_rounds = fit_params.get("early_stopping_rounds", 50)
+        early_stopping_rounds = int(early_stopping_rounds) if early_stopping_rounds is not None else None
+
+        model.fit(
+            X_train, y_train, X_val, y_val,
+            num_boost_round=num_boost_round,
+            early_stopping_rounds=early_stopping_rounds,
+        )
         probs = model.predict_proba(X_val)
         from sklearn.metrics import roc_auc_score, accuracy_score
         val_auc = roc_auc_score(y_val, probs) if len(set(y_val)) > 1 else 0.5
@@ -264,12 +275,23 @@ class ModelTrainer:
         logger.info(f"  LightGBM: val_auc={val_auc:.4f}, val_acc={val_acc:.4f}")
         return model, metrics
 
-    def _train_xgboost(self, X_train, y_train, X_val, y_val, config=None):
+    def _train_xgboost(self, X_train, y_train, X_val, y_val, config=None, model_params: dict | None = None, fit_params: dict | None = None):
         """训练XGBoost模型"""
-        model = XGBModel(**XGB_CONFIG)
-        model.fit(X_train, y_train, X_val, y_val,
-                 num_boost_round=config.get('max_epochs', 100) * 10 if config else 1000,
-                 early_stopping_rounds=50)
+        if fit_params is None:
+            fit_params = {}
+        params = {**XGB_CONFIG, **(model_params or {})}
+        model = XGBModel(**params)
+
+        default_num_boost_round = config.get('max_epochs', 100) * 10 if config else 1000
+        num_boost_round = int(fit_params.get("num_boost_round", default_num_boost_round))
+        early_stopping_rounds = fit_params.get("early_stopping_rounds", 50)
+        early_stopping_rounds = int(early_stopping_rounds) if early_stopping_rounds is not None else None
+
+        model.fit(
+            X_train, y_train, X_val, y_val,
+            num_boost_round=num_boost_round,
+            early_stopping_rounds=early_stopping_rounds,
+        )
         probs = model.predict_proba(X_val)
         from sklearn.metrics import roc_auc_score, accuracy_score
         val_auc = roc_auc_score(y_val, probs) if len(set(y_val)) > 1 else 0.5
@@ -279,16 +301,16 @@ class ModelTrainer:
         return model, metrics
 
     def train_model(self, model_type: str, X_train, y_train, X_val, y_val,
-                    config: dict = None) -> tuple:
+                    config: dict = None, model_params: dict | None = None, fit_params: dict | None = None) -> tuple:
         """训练单个模型"""
         if config is None:
             config = TRAINING_CONFIG
 
         # LightGBM/XGBoost走单独路径
         if model_type == "lgbm":
-            return self._train_lgbm(X_train, y_train, X_val, y_val, config)
+            return self._train_lgbm(X_train, y_train, X_val, y_val, config, model_params=model_params, fit_params=fit_params)
         if model_type == "xgboost":
-            return self._train_xgboost(X_train, y_train, X_val, y_val, config)
+            return self._train_xgboost(X_train, y_train, X_val, y_val, config, model_params=model_params, fit_params=fit_params)
 
         input_size = X_train.shape[2]
         seq_length = X_train.shape[1]
@@ -360,7 +382,7 @@ class ModelTrainer:
 
         return model, best_metrics
 
-    def cross_validate(self, model_type: str, X, y, cv_config: dict = None) -> dict:
+    def cross_validate(self, model_type: str, X, y, cv_config: dict = None, model_params: dict | None = None, fit_params: dict | None = None) -> dict:
         """时间序列交叉验证"""
         if cv_config is None:
             cv_config = CV_CONFIG
@@ -388,7 +410,9 @@ class ModelTrainer:
             X_test, y_test = X[test_idx], y[test_idx]
 
             model, metrics = self.train_model(
-                model_type, X_train, y_train, X_val, y_val
+                model_type, X_train, y_train, X_val, y_val,
+                model_params=model_params,
+                fit_params=fit_params,
             )
 
             # 在测试集上评估
