@@ -169,6 +169,8 @@ def _seq_to_tabular_rolling(
       - last_mean
       - last_mean_std
       - last_mean_std_slope
+      - last_mean_std_z
+      - last_mean_std_slope_z
     """
     X = np.asarray(X_rows, dtype=np.float32)
     n_rows, n_feat = X.shape
@@ -181,9 +183,23 @@ def _seq_to_tabular_rolling(
         raise ValueError("seq_length 太大，无法生成样本")
 
     agg = (agg or "last_mean_std").strip().lower()
-    if agg not in ("last", "last_mean", "last_mean_std", "last_mean_std_slope"):
-        raise ValueError("tabular_agg 仅支持: last / last_mean / last_mean_std / last_mean_std_slope")
-    mult = {"last": 1, "last_mean": 2, "last_mean_std": 3, "last_mean_std_slope": 4}[agg]
+    if agg not in (
+        "last",
+        "last_mean",
+        "last_mean_std",
+        "last_mean_std_slope",
+        "last_mean_std_z",
+        "last_mean_std_slope_z",
+    ):
+        raise ValueError("tabular_agg 仅支持: last / last_mean / last_mean_std / last_mean_std_slope / last_mean_std_z / last_mean_std_slope_z")
+    mult = {
+        "last": 1,
+        "last_mean": 2,
+        "last_mean_std": 3,
+        "last_mean_std_slope": 4,
+        "last_mean_std_z": 4,
+        "last_mean_std_slope_z": 5,
+    }[agg]
 
     out = np.empty((n_samples, n_feat * mult), dtype=np.float32)
 
@@ -222,7 +238,7 @@ def _seq_to_tabular_rolling(
             out[s, 0:n_feat] = last
             out[s, n_feat:2 * n_feat] = mean64.astype(np.float32)
             out[s, 2 * n_feat:3 * n_feat] = np.sqrt(var64).astype(np.float32)
-        else:
+        elif agg == "last_mean_std_slope":
             mean64 = np.full((n_feat,), np.nan, dtype=np.float64)
             var64 = np.full((n_feat,), np.nan, dtype=np.float64)
             valid = win_cnt > 0
@@ -233,6 +249,37 @@ def _seq_to_tabular_rolling(
             out[s, n_feat:2 * n_feat] = mean64.astype(np.float32)
             out[s, 2 * n_feat:3 * n_feat] = np.sqrt(var64).astype(np.float32)
             out[s, 3 * n_feat:4 * n_feat] = (last - first).astype(np.float32)
+        elif agg == "last_mean_std_z":
+            mean64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            var64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            valid = win_cnt > 0
+            mean64[valid] = win_sum[valid] / win_cnt[valid]
+            var64[valid] = win_sum2[valid] / win_cnt[valid] - mean64[valid] ** 2
+            var64 = np.maximum(var64, 0.0)
+            std64 = np.sqrt(var64)
+            z64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            ok = valid & (std64 > 0)
+            z64[ok] = (last.astype(np.float64)[ok] - mean64[ok]) / std64[ok]
+            out[s, 0:n_feat] = last
+            out[s, n_feat:2 * n_feat] = mean64.astype(np.float32)
+            out[s, 2 * n_feat:3 * n_feat] = std64.astype(np.float32)
+            out[s, 3 * n_feat:4 * n_feat] = z64.astype(np.float32)
+        else:  # last_mean_std_slope_z
+            mean64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            var64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            valid = win_cnt > 0
+            mean64[valid] = win_sum[valid] / win_cnt[valid]
+            var64[valid] = win_sum2[valid] / win_cnt[valid] - mean64[valid] ** 2
+            var64 = np.maximum(var64, 0.0)
+            std64 = np.sqrt(var64)
+            z64 = np.full((n_feat,), np.nan, dtype=np.float64)
+            ok = valid & (std64 > 0)
+            z64[ok] = (last.astype(np.float64)[ok] - mean64[ok]) / std64[ok]
+            out[s, 0:n_feat] = last
+            out[s, n_feat:2 * n_feat] = mean64.astype(np.float32)
+            out[s, 2 * n_feat:3 * n_feat] = std64.astype(np.float32)
+            out[s, 3 * n_feat:4 * n_feat] = (last - first).astype(np.float32)
+            out[s, 4 * n_feat:5 * n_feat] = z64.astype(np.float32)
 
         if s + 1 < n_samples:
             leaving = X[s]
@@ -893,8 +940,19 @@ def main():
     parser.add_argument('--seq-length', type=int, default=60)
     parser.add_argument('--tabular', action='store_true',
                         help='对 lgbm/xgboost 使用 tabular(last/mean/std) 表示，避免构造 3D 大矩阵（更省内存）')
-    parser.add_argument('--tabular-agg', default='last_mean_std', choices=['last', 'last_mean', 'last_mean_std', 'last_mean_std_slope'],
-                        help='tabular 聚合方式（用于 --tabular）：last / last_mean / last_mean_std / last_mean_std_slope')
+    parser.add_argument(
+        '--tabular-agg',
+        default='last_mean_std',
+        choices=[
+            'last',
+            'last_mean',
+            'last_mean_std',
+            'last_mean_std_slope',
+            'last_mean_std_z',
+            'last_mean_std_slope_z',
+        ],
+        help='tabular 聚合方式（用于 --tabular）：last / last_mean / last_mean_std / last_mean_std_slope / last_mean_std_z / last_mean_std_slope_z',
+    )
     parser.add_argument('--tabular-scale', default='robust', choices=['robust', 'none'],
                         help='tabular 缩放方式（用于 --tabular）：robust / none')
     parser.add_argument('--tabular-clip', type=float, default=5.0,
