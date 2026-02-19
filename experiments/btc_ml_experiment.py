@@ -746,6 +746,114 @@ def _regime_cv_single_train_report(
     return out
 
 
+def _regime_cv_single_train_report_two(
+    trainer: ModelTrainer,
+    model_type: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    regime1_s: np.ndarray,
+    regime2_s: np.ndarray | None,
+    cv_cfg: dict,
+    model_params: dict | None,
+    fit_params: dict | None,
+) -> dict:
+    """单模型训练；同时按两个 regime 输出 test AUC/覆盖率，并输出交叉(AND)分桶结果。"""
+    out1 = _regime_cv_single_train_report(
+        trainer,
+        model_type=model_type,
+        X=X,
+        y=y,
+        regime_s=regime1_s,
+        cv_cfg=cv_cfg,
+        model_params=model_params,
+        fit_params=fit_params,
+    )
+    if regime2_s is None:
+        return {"regime1": out1, "regime2": None, "intersection": None}
+
+    out2 = _regime_cv_single_train_report(
+        trainer,
+        model_type=model_type,
+        X=X,
+        y=y,
+        regime_s=regime2_s,
+        cv_cfg=cv_cfg,
+        model_params=model_params,
+        fit_params=fit_params,
+    )
+
+    # 交叉分桶：按 (r1, r2) 统计，采用“每折训练一次 -> 在 test 上按 mask 分桶”方式
+    splitter = TimeSeriesSplitter(
+        n_splits=int(cv_cfg["n_splits"]),
+        gap=int(cv_cfg["gap"]),
+        val_ratio=float(cv_cfg["val_ratio"]),
+        test_ratio=float(cv_cfg["test_ratio"]),
+    )
+    splits = splitter.split(len(X))
+
+    # 有效组合（>=0）
+    r1_vals = sorted([int(r) for r in np.unique(regime1_s) if int(r) >= 0])
+    r2_vals = sorted([int(r) for r in np.unique(regime2_s) if int(r) >= 0])
+    pairs = [(a, b) for a in r1_vals for b in r2_vals]
+    per_pair = {(a, b): {"test_auc": [], "test_acc": [], "test_n": [], "pos_sum": 0} for (a, b) in pairs}
+    valid_test_n = []
+
+    for _, (train_idx, val_idx, test_idx) in enumerate(splits):
+        train_idx = np.asarray(train_idx, dtype=np.int64)
+        val_idx = np.asarray(val_idx, dtype=np.int64)
+        test_idx = np.asarray(test_idx, dtype=np.int64)
+
+        model, _metrics = trainer.train_model(
+            model_type,
+            X[train_idx], y[train_idx],
+            X[val_idx], y[val_idx],
+            model_params=model_params,
+            fit_params=fit_params,
+        )
+        probs_all = model.predict_proba(X[test_idx])
+        y_all = y[test_idx]
+        r1_test = regime1_s[test_idx]
+        r2_test = regime2_s[test_idx]
+        vmask = (r1_test >= 0) & (r2_test >= 0)
+        valid_test_n.append(int(np.sum(vmask)))
+
+        for (a, b) in pairs:
+            m = (r1_test == a) & (r2_test == b)
+            if not np.any(m):
+                continue
+            probs_p = probs_all[m]
+            y_p = y_all[m]
+            auc_p = roc_auc_score(y_p, probs_p) if len(set(y_p)) > 1 else 0.5
+            acc_p = accuracy_score(y_p, (probs_p >= 0.5).astype(int))
+            per_pair[(a, b)]["test_auc"].append(float(auc_p))
+            per_pair[(a, b)]["test_acc"].append(float(acc_p))
+            per_pair[(a, b)]["test_n"].append(int(np.sum(m)))
+            per_pair[(a, b)]["pos_sum"] += int(np.sum(y_p))
+
+    total_valid = int(np.sum(valid_test_n)) if valid_test_n else 0
+    inter = {"pairs": [], "per_pair": {}}
+    for (a, b) in pairs:
+        rec = per_pair[(a, b)]
+        ns = rec["test_n"]
+        aucs = rec["test_auc"]
+        accs = rec["test_acc"]
+        n_sum = int(np.sum(ns)) if ns else 0
+        pos_sum = int(rec["pos_sum"])
+        key = f"r{a}&r{b}"
+        inter["pairs"].append(key)
+        inter["per_pair"][key] = {
+            "folds_used": int(len(aucs)),
+            "test_n": int(n_sum),
+            "coverage": float(n_sum / max(total_valid, 1)),
+            "test_up_ratio": float(pos_sum / max(n_sum, 1)),
+            "test_auc_mean": float(np.mean(aucs)) if aucs else 0.0,
+            "test_auc_std": float(np.std(aucs)) if aucs else 0.0,
+            "test_acc_mean": float(np.mean(accs)) if accs else 0.0,
+        }
+
+    return {"regime1": out1, "regime2": out2, "intersection": inter}
+
+
 class RollingWindowDataset(Dataset):
     """滚动窗口序列数据集：window = [s, s+seq_length)，label = y[s+seq_length]。
 
@@ -926,6 +1034,10 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    regime_window: int = 48,
                    regime_bins: int = 2,
                    regime_col: str | None = None,
+                   regime2_mode: str = "none",
+                   regime2_window: int = 48,
+                   regime2_bins: int = 2,
+                   regime2_col: str | None = None,
                    regime_train: str = "single",
                    regime_min_train: int = 2000,
                    regime_min_val: int = 500,
@@ -1017,6 +1129,7 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                     cv_cfg_full = {**CV_CONFIG, **(cv_cfg if cv_cfg else {})}
 
                     regime_mode_n = (regime_mode or "none").strip().lower()
+                    regime2_mode_n = (regime2_mode or "none").strip().lower()
                     regime_train_n = (regime_train or "single").strip().lower()
                     if regime_mode_n != "none" and regime_train_n == "separate":
                         train_end_idx = int(len(df_feat) * 0.7)
@@ -1077,12 +1190,25 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                         )
                         reg_s = _align_row_labels_to_samples(row_reg, n_rows=len(df_feat), seq_length=int(seq_length), align=align)
 
-                        cv_out = _regime_cv_single_train_report(
+                        reg2_s = None
+                        if regime2_mode_n != "none":
+                            row_reg2 = _compute_regime_row_labels(
+                                df_feat,
+                                mode=regime2_mode_n,
+                                window=int(regime2_window),
+                                bins=int(regime2_bins),
+                                train_end_idx=train_end_idx,
+                                regime_col=regime2_col,
+                            )
+                            reg2_s = _align_row_labels_to_samples(row_reg2, n_rows=len(df_feat), seq_length=int(seq_length), align=align)
+
+                        cv_out2 = _regime_cv_single_train_report_two(
                             trainer,
                             model_type=mt,
                             X=X,
                             y=y,
-                            regime_s=reg_s,
+                            regime1_s=reg_s,
+                            regime2_s=reg2_s,
                             cv_cfg=cv_cfg_full,
                             model_params=model_params,
                             fit_params=fit_params,
@@ -1091,19 +1217,23 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                         results["regime_mode"] = regime_mode_n
                         results["regime_window"] = int(regime_window)
                         results["regime_bins"] = int(regime_bins)
+                        if regime2_mode_n != "none":
+                            results["regime2_mode"] = regime2_mode_n
+                            results["regime2_window"] = int(regime2_window)
+                            results["regime2_bins"] = int(regime2_bins)
                         results["regime_train"] = "single"
 
-                        ov = cv_out.get("overall", {}) or {}
+                        ov = (cv_out2.get("regime1", {}) or {}).get("overall", {}) or {}
                         results[f"{mt}_val_auc"] = float(ov.get("val_auc_mean", 0.0))
                         results[f"{mt}_val_auc_std"] = float(ov.get("val_auc_std", 0.0))
                         results[f"{mt}_test_auc"] = float(ov.get("test_auc_mean", 0.0))
                         results[f"{mt}_test_auc_std"] = float(ov.get("test_auc_std", 0.0))
                         results[f"{mt}_test_acc"] = float(ov.get("test_acc_mean", 0.0))
                         results[f"{mt}_time"] = round(time.time() - t0, 1)
-                        results[f"{mt}_cv_folds"] = int(cv_out.get("folds", cv_cfg_full["n_splits"]))
+                        results[f"{mt}_cv_folds"] = int((cv_out2.get("regime1", {}) or {}).get("folds", cv_cfg_full["n_splits"]))
 
                         print(f"  {mt} (CV, regime=report): avg_test_auc={results[f'{mt}_test_auc']:.4f}±{results[f'{mt}_test_auc_std']:.4f}, avg_val_auc={results[f'{mt}_val_auc']:.4f}±{results[f'{mt}_val_auc_std']:.4f}, time={results[f'{mt}_time']:.1f}s")
-                        for k, v in (cv_out.get("per_regime", {}) or {}).items():
+                        for k, v in ((cv_out2.get("regime1", {}) or {}).get("per_regime", {}) or {}).items():
                             results[f"{mt}_{k}_test_auc"] = float(v.get("test_auc_mean", 0.0))
                             results[f"{mt}_{k}_test_auc_std"] = float(v.get("test_auc_std", 0.0))
                             results[f"{mt}_{k}_coverage"] = float(v.get("coverage", 0.0))
@@ -1115,6 +1245,27 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                                 f"cov={v.get('coverage',0.0)*100:.1f}%, up={v.get('test_up_ratio',0.0)*100:.1f}%, "
                                 f"test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}"
                             )
+                        if regime2_mode_n != "none":
+                            print(f"  {mt} (regime2={regime2_mode_n}):")
+                            for k, v in ((cv_out2.get("regime2", {}) or {}).get("per_regime", {}) or {}).items():
+                                print(
+                                    f"    {k}: test_auc={v.get('test_auc_mean',0.0):.4f}±{v.get('test_auc_std',0.0):.4f}, "
+                                    f"cov={v.get('coverage',0.0)*100:.1f}%, up={v.get('test_up_ratio',0.0)*100:.1f}%, "
+                                    f"test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}"
+                                )
+                            inter = cv_out2.get("intersection", {}) or {}
+                            per_pair = inter.get("per_pair", {}) or {}
+                            if per_pair:
+                                print(f"  {mt} (intersection {regime_mode_n} & {regime2_mode_n}):")
+                                # 按 test_auc_mean 降序打印前几个组合
+                                items = list(per_pair.items())
+                                items.sort(key=lambda kv: float(kv[1].get("test_auc_mean", 0.0)), reverse=True)
+                                for key, v in items[:6]:
+                                    print(
+                                        f"    {key}: test_auc={v.get('test_auc_mean',0.0):.4f}±{v.get('test_auc_std',0.0):.4f}, "
+                                        f"cov={v.get('coverage',0.0)*100:.1f}%, up={v.get('test_up_ratio',0.0)*100:.1f}%, "
+                                        f"test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}"
+                                    )
                     else:
                         cv_out = trainer.cross_validate(
                             mt, X, y,
@@ -1388,6 +1539,12 @@ def main():
     parser.add_argument('--regime-window', type=int, default=48, help='regime rolling 窗口（用于 vol/trend）')
     parser.add_argument('--regime-bins', type=int, default=2, help='regime 分桶数（仅用于 vol_quantile）')
     parser.add_argument('--regime-col', type=str, default=None, help='regime 使用的列名（用于 funding_sign，可不填自动猜）')
+    parser.add_argument('--regime2-mode', default='none',
+                        choices=['none', 'vol_quantile', 'trend_sign', 'funding_sign'],
+                        help='第二个 Regime 划分方式（用于 AND 交叉报表）：none / vol_quantile / trend_sign / funding_sign')
+    parser.add_argument('--regime2-window', type=int, default=48, help='regime2 rolling 窗口（用于 vol/trend）')
+    parser.add_argument('--regime2-bins', type=int, default=2, help='regime2 分桶数（仅用于 vol_quantile）')
+    parser.add_argument('--regime2-col', type=str, default=None, help='regime2 使用的列名（用于 funding_sign，可不填自动猜）')
     parser.add_argument('--regime-train', default='single', choices=['single', 'separate'],
                         help='regime 训练方式：single=全样本一个模型；separate=按regime分别训练')
     parser.add_argument('--regime-min-train', type=int, default=2000, help='separate 训练时每个regime每折最小训练样本数')
@@ -1504,6 +1661,10 @@ def main():
             regime_window=int(args.regime_window),
             regime_bins=int(args.regime_bins),
             regime_col=args.regime_col,
+            regime2_mode=str(args.regime2_mode),
+            regime2_window=int(args.regime2_window),
+            regime2_bins=int(args.regime2_bins),
+            regime2_col=args.regime2_col,
             regime_train=str(args.regime_train),
             regime_min_train=int(args.regime_min_train),
             regime_min_val=int(args.regime_min_val),
