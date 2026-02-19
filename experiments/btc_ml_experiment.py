@@ -669,7 +669,7 @@ def _regime_cv_single_train_report(
     regimes = sorted([int(r) for r in np.unique(regime_s) if int(r) >= 0])
 
     overall = {"val_auc": [], "test_auc": [], "test_acc": [], "test_n": [], "valid_test_n": []}
-    per_r = {r: {"test_auc": [], "test_acc": [], "test_n": []} for r in regimes}
+    per_r = {r: {"test_auc": [], "test_acc": [], "test_n": [], "pos_sum": 0} for r in regimes}
 
     for _, (train_idx, val_idx, test_idx) in enumerate(splits):
         train_idx = np.asarray(train_idx, dtype=np.int64)
@@ -708,6 +708,7 @@ def _regime_cv_single_train_report(
             per_r[r]["test_auc"].append(float(auc_r))
             per_r[r]["test_acc"].append(float(acc_r))
             per_r[r]["test_n"].append(int(np.sum(m)))
+            per_r[r]["pos_sum"] += int(np.sum(y_r))
 
     out = {
         "folds": int(len(splits)),
@@ -731,10 +732,12 @@ def _regime_cv_single_train_report(
         aucs = per_r[r]["test_auc"]
         accs = per_r[r]["test_acc"]
         n_sum = int(np.sum(ns)) if ns else 0
+        pos_sum = int(per_r[r]["pos_sum"])
         out["per_regime"][f"r{r}"] = {
             "folds_used": int(len(aucs)),
             "test_n": int(n_sum),
             "coverage": float(n_sum / max(total_valid, 1)),
+            "test_up_ratio": float(pos_sum / max(n_sum, 1)),
             "test_auc_mean": float(np.mean(aucs)) if aucs else 0.0,
             "test_auc_std": float(np.std(aucs)) if aucs else 0.0,
             "test_acc_mean": float(np.mean(accs)) if accs else 0.0,
