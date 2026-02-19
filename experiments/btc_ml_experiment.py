@@ -148,6 +148,71 @@ def _seq_to_tabular_nanaware(X_rows: np.ndarray, seq_length: int) -> np.ndarray:
     last = X[end]
     return np.concatenate([last, mean, std], axis=1).astype(np.float32)
 
+
+def _seq_to_tabular_rolling(
+    X_rows: np.ndarray,
+    seq_length: int,
+    agg: str,
+) -> np.ndarray:
+    """用滚动和的方式把 (N_rows, F) 转为 tabular（更省内存）。
+
+    对齐口径与 create_sequences 一致：
+      - window: [s, s+seq_length)
+      - label : y[s+seq_length]
+    所以样本数 n_samples = N_rows - seq_length。
+
+    agg:
+      - last
+      - last_mean
+      - last_mean_std
+    """
+    X = np.asarray(X_rows, dtype=np.float32)
+    n_rows, n_feat = X.shape
+    seq_length = int(seq_length)
+    n_samples = n_rows - seq_length
+    if n_samples <= 0:
+        raise ValueError("seq_length 太大，无法生成样本")
+
+    agg = (agg or "last_mean_std").strip().lower()
+    if agg not in ("last", "last_mean", "last_mean_std"):
+        raise ValueError("tabular_agg 仅支持: last / last_mean / last_mean_std")
+    mult = {"last": 1, "last_mean": 2, "last_mean_std": 3}[agg]
+
+    out = np.empty((n_samples, n_feat * mult), dtype=np.float32)
+
+    win_sum = np.zeros((n_feat,), dtype=np.float64)
+    win_sum2 = np.zeros((n_feat,), dtype=np.float64)
+    init = X[:seq_length].astype(np.float64)
+    win_sum[:] = np.sum(init, axis=0)
+    win_sum2[:] = np.sum(init ** 2, axis=0)
+    inv = 1.0 / float(seq_length)
+
+    for s in range(n_samples):
+        end_row = s + seq_length - 1
+        last = X[end_row]
+
+        if agg == "last":
+            out[s, 0:n_feat] = last
+        elif agg == "last_mean":
+            mean = (win_sum * inv).astype(np.float32)
+            out[s, 0:n_feat] = last
+            out[s, n_feat:2 * n_feat] = mean
+        else:
+            mean64 = win_sum * inv
+            var64 = win_sum2 * inv - mean64 ** 2
+            var64 = np.maximum(var64, 0.0)
+            out[s, 0:n_feat] = last
+            out[s, n_feat:2 * n_feat] = mean64.astype(np.float32)
+            out[s, 2 * n_feat:3 * n_feat] = np.sqrt(var64).astype(np.float32)
+
+        if s + 1 < n_samples:
+            leaving = X[s].astype(np.float64)
+            entering = X[s + seq_length].astype(np.float64)
+            win_sum += entering - leaving
+            win_sum2 += entering ** 2 - leaving ** 2
+
+    return out
+
 def build_features(df, horizon, label_mode='binary', pt_sl=(1.0, 1.0), feature_set: str = "ta+hf"):
     """Build features and labels for a given horizon."""
     feature_set = (feature_set or "ta+hf").strip().lower()
@@ -222,7 +287,14 @@ def create_sequences(df, feature_cols, seq_length=60):
     return np.array(X, dtype=np.float32), np.array(y)
 
 
-def create_tabular(df, feature_cols, seq_length=60):
+def create_tabular(
+    df,
+    feature_cols,
+    seq_length=60,
+    tabular_agg: str = "last_mean_std",
+    tabular_scale: str = "robust",
+    tabular_clip: float | None = 5.0,
+):
     """Create 2D tabular features for GBDT models: last + mean + std.
 
     重要：对齐口径与深度模型一致（用过去 seq_length 预测下一根的 label）。
@@ -241,12 +313,22 @@ def create_tabular(df, feature_cols, seq_length=60):
     train_end_s = int(n_samples * 0.7)
     # 训练样本覆盖到的最后一行 index = (train_end_s-1)+seq_length-1 = train_end_s+seq_length-2
     fit_end_row = max(train_end_s + seq_length - 2, 0)
-    scaler = RobustScaler()
-    scaler.fit(X_rows[:fit_end_row + 1])
-    X_scaled = scaler.transform(X_rows).astype(np.float32)
-    X_scaled = np.clip(X_scaled, -5, 5)
+    tabular_scale = (tabular_scale or "robust").strip().lower()
+    if tabular_scale not in ("robust", "none"):
+        raise ValueError("tabular_scale 仅支持: robust / none")
 
-    X_tab = _seq_to_tabular_fast(X_scaled, seq_length=seq_length)
+    if tabular_scale == "robust":
+        scaler = RobustScaler()
+        scaler.fit(X_rows[:fit_end_row + 1])
+        X_rows = scaler.transform(X_rows).astype(np.float32)
+
+    if tabular_clip is not None:
+        clip_v = float(tabular_clip)
+        if clip_v > 0:
+            X_rows = np.clip(X_rows, -clip_v, clip_v)
+
+    # 用 rolling 版本生成 tabular，避免 _seq_to_tabular_fast 的 cumsum/cumsum2 大矩阵引发 OOM
+    X_tab = _seq_to_tabular_rolling(X_rows, seq_length=seq_length, agg=tabular_agg)
     y = y_rows[seq_length:]
     return X_tab, y
 
@@ -400,7 +482,10 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    max_features: int = MAX_FEATURES,
                    batch_size: int | None = None,
                    prune_corr: float | None = None,
-                   corr_method: str = "pearson"):
+                   corr_method: str = "pearson",
+                   tabular_agg: str = "last_mean_std",
+                   tabular_scale: str = "robust",
+                   tabular_clip: float | None = 5.0):
     """Run single horizon experiment with multiple models."""
     df_feat, feature_cols = build_features(df, horizon, label_mode, pt_sl, feature_set=feature_set)
     if len(df_feat) < 500:
@@ -434,7 +519,14 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
 
     # ============ 1) GBDT（默认 tabular） ============
     if use_tabular:
-        X, y = create_tabular(df_feat, used_cols, seq_length)
+        X, y = create_tabular(
+            df_feat,
+            used_cols,
+            seq_length=seq_length,
+            tabular_agg=tabular_agg,
+            tabular_scale=tabular_scale,
+            tabular_clip=tabular_clip,
+        )
         n = len(X)
         train_end = int(n * 0.7)
         val_end = int(n * 0.85)
@@ -623,6 +715,12 @@ def main():
     parser.add_argument('--seq-length', type=int, default=60)
     parser.add_argument('--tabular', action='store_true',
                         help='对 lgbm/xgboost 使用 tabular(last/mean/std) 表示，避免构造 3D 大矩阵（更省内存）')
+    parser.add_argument('--tabular-agg', default='last_mean_std', choices=['last', 'last_mean', 'last_mean_std'],
+                        help='tabular 聚合方式（用于 --tabular）：last / last_mean / last_mean_std')
+    parser.add_argument('--tabular-scale', default='robust', choices=['robust', 'none'],
+                        help='tabular 缩放方式（用于 --tabular）：robust / none')
+    parser.add_argument('--tabular-clip', type=float, default=5.0,
+                        help='tabular 缩放后裁剪阈值；设为 0 表示不裁剪（用于 --tabular）')
     parser.add_argument('--rolling-dataset', action='store_true',
                         help='深度模型使用滚动窗口 Dataset 动态取样（显著降低内存峰值；推荐 transformer/lstm 在大样本上用）')
     parser.add_argument('--no-select', action='store_true', help='关闭特征选择，直接使用全部候选特征')
@@ -709,6 +807,9 @@ def main():
             batch_size=args.batch_size,
             prune_corr=args.prune_corr,
             corr_method=str(args.corr_method),
+            tabular_agg=str(args.tabular_agg),
+            tabular_scale=str(args.tabular_scale),
+            tabular_clip=(None if float(args.tabular_clip) <= 0 else float(args.tabular_clip)),
         )
         if result:
             all_results.append(result)
