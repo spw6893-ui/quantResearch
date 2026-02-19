@@ -647,6 +647,97 @@ def _regime_cv_separate_train(
     return out
 
 
+def _regime_cv_single_train_report(
+    trainer: ModelTrainer,
+    model_type: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    regime_s: np.ndarray,
+    cv_cfg: dict,
+    model_params: dict | None,
+    fit_params: dict | None,
+) -> dict:
+    """单模型训练，但按 regime 输出每折 test AUC 与覆盖率（coverage）。"""
+    splitter = TimeSeriesSplitter(
+        n_splits=int(cv_cfg["n_splits"]),
+        gap=int(cv_cfg["gap"]),
+        val_ratio=float(cv_cfg["val_ratio"]),
+        test_ratio=float(cv_cfg["test_ratio"]),
+    )
+    splits = splitter.split(len(X))
+    regimes = sorted([int(r) for r in np.unique(regime_s)])
+
+    overall = {"val_auc": [], "test_auc": [], "test_acc": [], "test_n": []}
+    per_r = {r: {"test_auc": [], "test_acc": [], "test_n": []} for r in regimes}
+
+    for _, (train_idx, val_idx, test_idx) in enumerate(splits):
+        train_idx = np.asarray(train_idx, dtype=np.int64)
+        val_idx = np.asarray(val_idx, dtype=np.int64)
+        test_idx = np.asarray(test_idx, dtype=np.int64)
+
+        model, metrics = trainer.train_model(
+            model_type,
+            X[train_idx], y[train_idx],
+            X[val_idx], y[val_idx],
+            model_params=model_params,
+            fit_params=fit_params,
+        )
+
+        probs_all = model.predict_proba(X[test_idx])
+        y_all = y[test_idx]
+        test_auc_all = roc_auc_score(y_all, probs_all) if len(set(y_all)) > 1 else 0.5
+        test_acc_all = accuracy_score(y_all, (probs_all >= 0.5).astype(int))
+
+        overall["val_auc"].append(float(metrics.get("val_auc", 0.0)))
+        overall["test_auc"].append(float(test_auc_all))
+        overall["test_acc"].append(float(test_acc_all))
+        overall["test_n"].append(int(len(test_idx)))
+
+        r_test = regime_s[test_idx]
+        for r in regimes:
+            m = r_test == r
+            if not np.any(m):
+                continue
+            probs_r = probs_all[m]
+            y_r = y_all[m]
+            auc_r = roc_auc_score(y_r, probs_r) if len(set(y_r)) > 1 else 0.5
+            acc_r = accuracy_score(y_r, (probs_r >= 0.5).astype(int))
+            per_r[r]["test_auc"].append(float(auc_r))
+            per_r[r]["test_acc"].append(float(acc_r))
+            per_r[r]["test_n"].append(int(np.sum(m)))
+
+    out = {
+        "folds": int(len(splits)),
+        "regimes": regimes,
+        "overall": {
+            "val_auc_mean": float(np.mean(overall["val_auc"])) if overall["val_auc"] else 0.0,
+            "val_auc_std": float(np.std(overall["val_auc"])) if overall["val_auc"] else 0.0,
+            "test_auc_mean": float(np.mean(overall["test_auc"])) if overall["test_auc"] else 0.0,
+            "test_auc_std": float(np.std(overall["test_auc"])) if overall["test_auc"] else 0.0,
+            "test_acc_mean": float(np.mean(overall["test_acc"])) if overall["test_acc"] else 0.0,
+            "total_test_n": int(np.sum(overall["test_n"])) if overall["test_n"] else 0,
+        },
+        "per_regime": {},
+    }
+
+    total_test_n = out["overall"]["total_test_n"]
+    for r in regimes:
+        ns = per_r[r]["test_n"]
+        aucs = per_r[r]["test_auc"]
+        accs = per_r[r]["test_acc"]
+        n_sum = int(np.sum(ns)) if ns else 0
+        out["per_regime"][f"r{r}"] = {
+            "folds_used": int(len(aucs)),
+            "test_n": int(n_sum),
+            "coverage": float(n_sum / max(total_test_n, 1)),
+            "test_auc_mean": float(np.mean(aucs)) if aucs else 0.0,
+            "test_auc_std": float(np.std(aucs)) if aucs else 0.0,
+            "test_acc_mean": float(np.mean(accs)) if accs else 0.0,
+        }
+
+    return out
+
+
 class RollingWindowDataset(Dataset):
     """滚动窗口序列数据集：window = [s, s+seq_length)，label = y[s+seq_length]。
 
@@ -966,6 +1057,51 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                             results[f"{mt}_{k}_test_n"] = int(v.get("test_n", 0))
                             results[f"{mt}_{k}_folds"] = int(v.get("folds_used", 0))
                             print(f"    {k}: test_auc={v.get('test_auc_mean',0.0):.4f}±{v.get('test_auc_std',0.0):.4f}, test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}")
+                    elif regime_mode_n != "none" and regime_train_n == "single":
+                        train_end_idx = int(len(df_feat) * 0.7)
+                        row_reg = _compute_regime_row_labels(
+                            df_feat,
+                            mode=regime_mode_n,
+                            window=int(regime_window),
+                            bins=int(regime_bins),
+                            train_end_idx=train_end_idx,
+                            regime_col=regime_col,
+                        )
+                        reg_s = _align_row_labels_to_samples(row_reg, n_rows=len(df_feat), seq_length=int(seq_length), align=align)
+
+                        cv_out = _regime_cv_single_train_report(
+                            trainer,
+                            model_type=mt,
+                            X=X,
+                            y=y,
+                            regime_s=reg_s,
+                            cv_cfg=cv_cfg_full,
+                            model_params=model_params,
+                            fit_params=fit_params,
+                        )
+
+                        results["regime_mode"] = regime_mode_n
+                        results["regime_window"] = int(regime_window)
+                        results["regime_bins"] = int(regime_bins)
+                        results["regime_train"] = "single"
+
+                        ov = cv_out.get("overall", {}) or {}
+                        results[f"{mt}_val_auc"] = float(ov.get("val_auc_mean", 0.0))
+                        results[f"{mt}_val_auc_std"] = float(ov.get("val_auc_std", 0.0))
+                        results[f"{mt}_test_auc"] = float(ov.get("test_auc_mean", 0.0))
+                        results[f"{mt}_test_auc_std"] = float(ov.get("test_auc_std", 0.0))
+                        results[f"{mt}_test_acc"] = float(ov.get("test_acc_mean", 0.0))
+                        results[f"{mt}_time"] = round(time.time() - t0, 1)
+                        results[f"{mt}_cv_folds"] = int(cv_out.get("folds", cv_cfg_full["n_splits"]))
+
+                        print(f"  {mt} (CV, regime=report): avg_test_auc={results[f'{mt}_test_auc']:.4f}±{results[f'{mt}_test_auc_std']:.4f}, avg_val_auc={results[f'{mt}_val_auc']:.4f}±{results[f'{mt}_val_auc_std']:.4f}, time={results[f'{mt}_time']:.1f}s")
+                        for k, v in (cv_out.get("per_regime", {}) or {}).items():
+                            results[f"{mt}_{k}_test_auc"] = float(v.get("test_auc_mean", 0.0))
+                            results[f"{mt}_{k}_test_auc_std"] = float(v.get("test_auc_std", 0.0))
+                            results[f"{mt}_{k}_coverage"] = float(v.get("coverage", 0.0))
+                            results[f"{mt}_{k}_test_n"] = int(v.get("test_n", 0))
+                            results[f"{mt}_{k}_folds"] = int(v.get("folds_used", 0))
+                            print(f"    {k}: test_auc={v.get('test_auc_mean',0.0):.4f}±{v.get('test_auc_std',0.0):.4f}, cov={v.get('coverage',0.0)*100:.1f}%, test_n={v.get('test_n',0)}, folds={v.get('folds_used',0)}")
                     else:
                         cv_out = trainer.cross_validate(
                             mt, X, y,
