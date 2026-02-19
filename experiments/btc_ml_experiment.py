@@ -1051,7 +1051,11 @@ def main():
 
     cols = ['horizon', 'n_features', 'n_train', 'n_test', 'test_up_ratio']
     for mt in model_types:
-        cols.extend([f'{mt}_test_auc', f'{mt}_val_auc', f'{mt}_time'])
+        cols.extend([
+            f'{mt}_test_auc', f'{mt}_test_auc_std',
+            f'{mt}_val_auc', f'{mt}_val_auc_std',
+            f'{mt}_time', f'{mt}_cv_folds',
+        ])
     display_cols = [c for c in cols if c in df_res.columns]
 
     pd.set_option('display.max_columns', 30)
