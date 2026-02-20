@@ -316,6 +316,13 @@ def build_features(
     alpha101_rank_window: int = 20,
     alpha101_adv_window: int = 20,
     alpha101_window_scale: float = 1.0,
+    add_alpha_style: bool = False,
+    alpha_style_cols: str | None = None,
+    alpha_style_prefixes: str | None = None,
+    alpha_style_regex: str | None = None,
+    alpha_style_max_cols: int = 20,
+    alpha_style_windows: str = "2,3,5,8,10",
+    alpha_style_ops: str = "delta,pct,z,ema,corr_ret",
 ):
     """Build features and labels for a given horizon."""
     feature_set = (feature_set or "ta+hf").strip().lower()
@@ -373,6 +380,50 @@ def build_features(
         )
         a_df = compute_alpha101_single(df, alphas=alphas, cfg=cfg, prefix="alpha101_")
         df = pd.concat([df, a_df], axis=1)
+
+    # alpha-style（对 HF 列批量做 rolling/ewm/corr）：更偏短周期/微观结构连续特征
+    if bool(add_alpha_style):
+        try:
+            from data.alpha_style_features import AlphaStyleConfig, add_alpha_style_features
+        except Exception as e:
+            raise RuntimeError(f"导入 alpha_style_features 失败：{e}") from e
+
+        def _parse_int_list(s: str) -> tuple[int, ...]:
+            xs: list[int] = []
+            for x in str(s).split(","):
+                x = str(x).strip()
+                if not x:
+                    continue
+                xs.append(int(float(x)))
+            return tuple(xs)
+
+        def _parse_str_list(s: str) -> tuple[str, ...]:
+            xs: list[str] = []
+            for x in str(s).split(","):
+                x = str(x).strip()
+                if not x:
+                    continue
+                xs.append(x)
+            return tuple(xs)
+
+        cols = _parse_str_list(alpha_style_cols) if alpha_style_cols else ()
+        prefixes = _parse_str_list(alpha_style_prefixes) if alpha_style_prefixes else AlphaStyleConfig().prefixes
+        windows = _parse_int_list(alpha_style_windows) if alpha_style_windows else AlphaStyleConfig().windows
+        ops = _parse_str_list(alpha_style_ops) if alpha_style_ops else AlphaStyleConfig().ops
+
+        cfg = AlphaStyleConfig(
+            prefixes=prefixes,
+            cols=cols,
+            regex=(str(alpha_style_regex).strip() if alpha_style_regex else None),
+            max_cols=int(alpha_style_max_cols),
+            windows=windows,
+            ops=ops,
+        )
+        n0 = df.shape[1]
+        df = add_alpha_style_features(df, cfg, prefix="as_")
+        n1 = df.shape[1]
+        if n1 > n0:
+            print(f"  Alpha-style features: +{n1 - n0} (max_cols={int(alpha_style_max_cols)}, windows={list(windows)}, ops={list(ops)})")
 
     # 先计算 future_return，再构造 label；对最后 horizon 行显式置为 NaN 并丢弃，避免把未知标签误当成 0
     df['future_return'] = df['close'].shift(-horizon) / df['close'] - 1
@@ -1388,6 +1439,13 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
                    alpha101_rank_window: int = 20,
                    alpha101_adv_window: int = 20,
                    alpha101_window_scale: float = 1.0,
+                   add_alpha_style: bool = False,
+                   alpha_style_cols: str | None = None,
+                   alpha_style_prefixes: str | None = None,
+                   alpha_style_regex: str | None = None,
+                   alpha_style_max_cols: int = 20,
+                   alpha_style_windows: str = "2,3,5,8,10",
+                   alpha_style_ops: str = "delta,pct,z,ema,corr_ret",
                    always_include_prefix: str | None = None,
                    always_include_cols: str | None = None,
                    no_select: bool = False,
@@ -1444,6 +1502,13 @@ def run_experiment(df, horizon, model_types, seq_length=60, label_mode='binary',
         alpha101_rank_window=int(alpha101_rank_window),
         alpha101_adv_window=int(alpha101_adv_window),
         alpha101_window_scale=float(alpha101_window_scale),
+        add_alpha_style=bool(add_alpha_style),
+        alpha_style_cols=alpha_style_cols,
+        alpha_style_prefixes=alpha_style_prefixes,
+        alpha_style_regex=alpha_style_regex,
+        alpha_style_max_cols=int(alpha_style_max_cols),
+        alpha_style_windows=str(alpha_style_windows),
+        alpha_style_ops=str(alpha_style_ops),
     )
     if len(df_feat) < 500:
         print(f"  Insufficient data ({len(df_feat)} rows), skipping")
@@ -1987,6 +2052,20 @@ def main():
                         help='Alpha101 中 adv 的窗口（默认20）')
     parser.add_argument('--alpha101-window-scale', type=float, default=1.0,
                         help='Alpha101 内部窗口缩放系数（默认1.0）。例如 0.25 会把 20→5、10→2，用于探索更短周期因子。')
+    parser.add_argument('--add-alpha-style', action='store_true',
+                        help='对 HF 列批量生成短窗 alpha-style 连续特征（rolling/ewm/corr），更偏短周期/微观结构。默认选 oi_/funding_/liq_/at_/cs_/ls_ 前缀列（按方差取前N）。')
+    parser.add_argument('--alpha-style-cols', type=str, default=None,
+                        help='指定要生成 alpha-style 的列名列表（逗号分隔）。若提供则忽略 --alpha-style-prefixes/--alpha-style-regex。')
+    parser.add_argument('--alpha-style-prefixes', type=str, default=None,
+                        help='按列名前缀选择（逗号分隔）。默认 oi_,funding_,liq_,at_,cs_,ls_。')
+    parser.add_argument('--alpha-style-regex', type=str, default=None,
+                        help='按正则匹配列名（例如 \"^(oi_|funding_)\"）。与 prefixes 取并集。')
+    parser.add_argument('--alpha-style-max-cols', type=int, default=20,
+                        help='最多选多少列做 alpha-style（按方差排序取前N），避免特征爆炸。0/负数表示不限制（不建议）。')
+    parser.add_argument('--alpha-style-windows', type=str, default='2,3,5,8,10',
+                        help='rolling/ewm 窗口列表（逗号分隔），建议短窗 2~10。')
+    parser.add_argument('--alpha-style-ops', type=str, default='delta,pct,z,ema,corr_ret',
+                        help='生成算子（逗号分隔）：delta,pct,z,ema,corr_ret。')
     parser.add_argument('--always-include-prefix', type=str, default=None,
                         help='强制保留特征名前缀（逗号分隔），不受特征选择丢弃影响。例如: state_,alpha101_')
     parser.add_argument('--always-include-cols', type=str, default=None,
@@ -2138,6 +2217,13 @@ def main():
             alpha101_rank_window=int(args.alpha101_rank_window),
             alpha101_adv_window=int(args.alpha101_adv_window),
             alpha101_window_scale=float(args.alpha101_window_scale),
+            add_alpha_style=bool(args.add_alpha_style),
+            alpha_style_cols=args.alpha_style_cols,
+            alpha_style_prefixes=args.alpha_style_prefixes,
+            alpha_style_regex=args.alpha_style_regex,
+            alpha_style_max_cols=int(args.alpha_style_max_cols),
+            alpha_style_windows=str(args.alpha_style_windows),
+            alpha_style_ops=str(args.alpha_style_ops),
             always_include_prefix=args.always_include_prefix,
             always_include_cols=args.always_include_cols,
             no_select=bool(args.no_select),
